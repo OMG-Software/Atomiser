@@ -125,7 +125,12 @@ The production setup is documented in `README.md` and uses the nginx/systemd fil
 
 ## Common gotchas
 
-- **Not a git repository.** There is no `.git` directory here; do not assume git workflows exist.
+- **Git repository.** Tracked with git and hosted publicly at
+  <https://github.com/OMG-Software/Atomiser> (`origin`, default branch `main`).
+- **Never commit secrets or runtime data.** `.gitignore` excludes `.env`, `data/`
+  (real user accounts, Argon2 hashes, TOTP secrets), `uploads/`, `venv/`, deploy
+  zips and debug cookie files. The repo is public — check `git status` before
+  committing and never use `git add -f` on those paths.
 - **Tests exist.** Run the suite with `venv\Scripts\python -m pytest tests\` (Windows) or `venv/bin/python -m pytest tests/`. Add tests for new features in the existing module files.
 - **Template signature shim.** `TemplateResponse` accepts either signature; prefer the newer `(request, name, context)` form for new code, but existing routes use the old form.
 - **Module-level `templates` variable.** It is `None` until `main.py` assigns `auth.templates = app_templates`, etc. Do not try to render templates at import time.
