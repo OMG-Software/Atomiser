@@ -34,5 +34,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Local agent overrides (plans under .claude/plans/ are kept)
+# Local agent settings, recreated by the tooling as permissions are granted
 .claude/settings.local.json

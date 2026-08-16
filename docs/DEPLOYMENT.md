@@ -461,4 +461,4 @@ Uvicorn is already started with `--proxy-headers` in the provided systemd unit.
 
 ---
 
-For day-to-day operation and feature development, see `README.md`.
+For day-to-day operation and feature development, see [`README.md`](../README.md).

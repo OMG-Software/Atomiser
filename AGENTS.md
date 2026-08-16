@@ -55,9 +55,12 @@ Atomiser/
 ├── tests/                   # pytest suite covering auth, TOTP, passkeys, roles, invites, bootstrap, videos, settings
 ├── requirements.txt
 ├── .env.example
+├── docs/
+│   ├── DEPLOYMENT.md        # Full production deployment guide
+│   └── PLAN.md              # Original implementation plan
 ├── README.md                # Quick start and feature overview
-├── DEPLOYMENT.md            # Full production deployment guide
-└── PLAN.md                  # Original implementation plan
+├── AGENTS.md                # This guide (CLAUDE.md imports it)
+└── CLAUDE.md                # Agent entry point; imports AGENTS.md
 ```
 
 ## Roles and permissions

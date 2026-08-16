@@ -42,7 +42,7 @@ The default page title is **Atomiser Site** and is editable in the admin setting
 
 ## Production deployment
 
-The recommended stack is a Linux VPS/bare-metal server with nginx as a reverse proxy. A detailed, step-by-step guide is in [`DEPLOYMENT.md`](DEPLOYMENT.md); the high-level steps are:
+The recommended stack is a Linux VPS/bare-metal server with nginx as a reverse proxy. A detailed, step-by-step guide is in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md); the high-level steps are:
 
 1. Create an unprivileged user and deploy the code to `/opt/atomiser`.
 2. Create `/etc/atomiser/atomiser.env` from `.env.example` and set `ENV=production`, `SECRET_KEY`, paths, etc.
@@ -63,7 +63,7 @@ The recommended stack is a Linux VPS/bare-metal server with nginx as a reverse p
 6. Obtain TLS certificates (e.g. Let's Encrypt with certbot) and install `nginx/atomiser.conf`.
 7. Reload nginx.
 
-See [`DEPLOYMENT.md`](DEPLOYMENT.md) for TLS setup, backup strategy, troubleshooting, and the full security checklist.
+See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for TLS setup, backup strategy, troubleshooting, and the full security checklist.
 
 ## Security notes
 
