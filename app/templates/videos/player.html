@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}{{ video.title }} — {{ site_title|default('Atomiser Site') }}{% endblock %}
+{% block content %}
+<div class="player-shell">
+  <video class="video-player" controls preload="metadata" poster="{% if video.thumbnail_path %}/thumb/{{ video.uuid }}{% endif %}">
+    {% for r in renditions %}
+      <source src="/stream/{{ video.uuid }}/{{ r.file_path.split('/')[-1] }}" type="video/mp4" data-label="{{ r.label }}">
+    {% endfor %}
+    Your browser does not support the video tag.
+  </video>
+</div>
+
+<div class="player-info">
+  <h1>{{ video.title }}</h1>
+  <div class="player-meta">
+    <a class="uploader" href="/u/{{ video.owner_id }}">
+      <span class="avatar avatar-sm" style="background: {{ (video.owner_name or '?')|avatar_color }}">{{ (video.owner_name or '?')|initials }}</span>
+      {{ video.owner_name }}
+    </a>
+    <span>·</span>
+    <span>{{ video.created_at|timeago }}</span>
+    {% if video.duration_seconds %}<span>·</span><span>{{ video.duration_seconds|duration }}</span>{% endif %}
+    <span class="chips">
+      {% if video.visibility == 'private' %}<span class="chip">Private</span>{% else %}<span class="chip">Public</span>{% endif %}
+    </span>
+  </div>
+
+  {% if video.description %}
+    <div class="player-description">{{ video.description }}</div>
+  {% endif %}
+
+  {% if is_owner or is_admin %}
+    <div class="player-actions">
+      <details style="width:100%;">
+        <summary class="btn btn-secondary btn-small" style="cursor:pointer; display:inline-flex; width:auto;">Edit details</summary>
+        <form method="POST" action="/videos/{{ video.uuid }}/edit" class="edit-form" style="max-width:560px;">
+          <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+          <label for="title">Title</label>
+          <input type="text" id="title" name="title" value="{{ video.title }}" required maxlength="200">
+
+          <label for="description">Description</label>
+          <textarea id="description" name="description" maxlength="5000" rows="4">{{ video.description or '' }}</textarea>
+
+          <button type="submit" class="btn">Save changes</button>
+        </form>
+      </details>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

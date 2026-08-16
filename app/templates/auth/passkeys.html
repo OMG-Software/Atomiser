@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Passkeys — {{ site_title|default('Atomiser Site') }}{% endblock %}
+{% block content %}
+<div class="card" style="max-width: 600px; margin: 2rem auto;">
+  <h1>Passkeys</h1>
+
+  {% if credentials %}
+    <ul>
+      {% for cred in credentials %}
+        <li class="meta">Registered credential #{{ cred.id }} — {{ cred.transports or 'internal' }}</li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="meta">No passkeys registered yet.</p>
+  {% endif %}
+
+  <form id="passkey-register-form">
+    <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+    <button type="submit" class="btn">Register a new passkey</button>
+  </form>
+  <p id="passkey-msg" class="meta"></p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='/js/passkeys.js') }}"></script>
+{% endblock %}

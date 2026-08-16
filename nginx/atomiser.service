@@ -1,0 +1,25 @@
+[Unit]
+Description=Atomiser private video hosting app
+After=network.target
+
+[Service]
+Type=notify
+User=atomiser
+Group=atomiser
+WorkingDirectory=/opt/atomiser
+Environment="PATH=/opt/atomiser/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/etc/atomiser/atomiser.env
+ExecStart=/opt/atomiser/venv/bin/uvicorn app.main:app --uds /run/atomiser/atomiser.sock --proxy-headers
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/atomiser/data /opt/atomiser/uploads /run/atomiser
+
+[Install]
+WantedBy=multi-user.target

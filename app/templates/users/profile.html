@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}{{ profile_user.display_name or profile_user.email }} — {{ site_title|default('Atomiser Site') }}{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="profile-header">
+    <span class="avatar avatar-xl" style="background: {{ (profile_user.display_name or profile_user.email or '?')|avatar_color }}">{{ (profile_user.display_name or profile_user.email or '?')|initials }}</span>
+    <div>
+      <h1>{{ profile_user.display_name or profile_user.email }}</h1>
+      <div class="meta">Member since {{ profile_user.created_at|timeago }}</div>
+    </div>
+  </div>
+
+  {% if user and user.id == profile_user.id %}
+    <details style="margin-top:1.25rem;">
+      <summary class="btn btn-secondary btn-small" style="cursor:pointer; display:inline-flex; width:auto;">Edit profile</summary>
+      <form method="POST" action="/profile" class="edit-form" style="max-width:480px;">
+        <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+        <label for="display_name">Display name</label>
+        <input type="text" id="display_name" name="display_name" value="{{ profile_user.display_name or '' }}" required maxlength="80">
+        <div style="margin-top:1rem;">
+          <button type="submit" class="btn">Save</button>
+        </div>
+      </form>
+    </details>
+
+    <details style="margin-top:1.25rem;">
+      <summary class="btn btn-secondary btn-small" style="cursor:pointer; display:inline-flex; width:auto;">Change password</summary>
+      <form method="POST" action="/profile/password" class="edit-form" style="max-width:480px;">
+        <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+        {% if password_error %}
+          <div class="alert alert-error">{{ password_error }}</div>
+        {% endif %}
+        {% if request.query_params.get('password_changed') %}
+          <div class="alert alert-success">Your password has been changed.</div>
+        {% endif %}
+        <label for="current_password">Current password</label>
+        <input type="password" id="current_password" name="current_password" autocomplete="current-password" required>
+        <label for="new_password" style="margin-top:0.75rem;">New password</label>
+        <input type="password" id="new_password" name="new_password" autocomplete="new-password" minlength="12" required>
+        <label for="confirm_password" style="margin-top:0.75rem;">Confirm new password</label>
+        <input type="password" id="confirm_password" name="confirm_password" autocomplete="new-password" minlength="12" required>
+        <p class="meta" style="margin-top:0.5rem;">At least 12 characters, including letters and digits.</p>
+        <div style="margin-top:1rem;">
+          <button type="submit" class="btn">Change password</button>
+        </div>
+      </form>
+    </details>
+
+    <p class="meta" style="margin-top:1.25rem;">
+      <a href="/auth/totp/setup">Set up two-factor authentication</a> · <a href="/auth/passkeys">Manage passkeys</a>
+    </p>
+  {% endif %}
+</div>
+
+<div class="section-head" style="margin-top:1.75rem;">
+  <h2>Videos</h2>
+</div>
+{% if videos %}
+  <div class="grid">
+    {% for video in videos %}
+      <article class="card video-card">
+        <a href="/videos/{{ video.uuid }}">
+          <div class="thumb-wrap">
+            {% if video.thumbnail_path %}
+              <img src="/thumb/{{ video.uuid }}" alt="{{ video.title }}" loading="lazy">
+            {% else %}
+              <div class="thumb-placeholder" aria-hidden="true"></div>
+            {% endif %}
+            <span class="play-icon" aria-hidden="true"><span><svg viewBox="0 0 24 24"><path d="M9 7v10l8-5-8-5Z"/></svg></span></span>
+            {% if video.duration_seconds %}<span class="duration-badge">{{ video.duration_seconds|duration }}</span>{% endif %}
+          </div>
+        </a>
+        <div class="body">
+          <h3><a href="/videos/{{ video.uuid }}">{{ video.title }}</a></h3>
+          <div class="meta" style="margin-top:0.35rem;">
+            {{ video.created_at|timeago }}
+            {% if video.visibility == 'private' %} · <span class="chip" style="padding:0.1rem 0.5rem;">Private</span>{% endif %}
+            {% if video.status != 'ready' %} · {{ video.status }}{% endif %}
+          </div>
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty-state">
+    <h2>No videos yet</h2>
+    <p>This user hasn't uploaded anything yet.</p>
+  </div>
+{% endif %}
+{% endblock %}

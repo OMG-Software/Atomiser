@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Site settings — {{ site_title|default('Atomiser Site') }}{% endblock %}
+{% block content %}
+<div class="card" style="max-width: 500px;">
+  <h1>Site settings</h1>
+  <form method="POST" action="/admin/settings">
+    <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+
+    <label for="site_title">Page title</label>
+    <input type="text" id="site_title" name="site_title" value="{{ site_title }}" required maxlength="120">
+
+    <button type="submit" class="btn">Save</button>
+  </form>
+</div>
+{% endblock %}

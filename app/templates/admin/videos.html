@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Videos — {{ site_title|default('Atomiser Site') }}{% endblock %}
+{% block content %}
+<h1>Videos</h1>
+
+<table>
+  <thead>
+    <tr>
+      <th>UUID</th>
+      <th>Title</th>
+      <th>Owner</th>
+      <th>Visibility</th>
+      <th>Status</th>
+      <th>Uploaded</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for v in videos %}
+      <tr>
+        <td><code>{{ v.uuid[:8] }}</code></td>
+        <td><a href="/videos/{{ v.uuid }}">{{ v.title }}</a></td>
+        <td>{{ v.owner_email }}</td>
+        <td>{{ v.visibility }}</td>
+        <td>{{ v.status }}</td>
+        <td>{{ v.created_at }}</td>
+        <td>
+          <form method="POST" action="/admin/videos/{{ v.uuid }}/delete" style="display:inline;" onsubmit="return confirm('Delete this video?')">
+            <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+            <button type="submit" class="btn btn-danger">Delete</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="csrf-token" content="{{ request.state.csrf_token }}">
+  <title>{% block title %}{{ site_title|default('Atomiser Site') }}{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/css/atomiser.css') }}?v={{ asset_version('css/atomiser.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-brand">
+      <a href="/">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M9 7v10l8-5-8-5Z" fill="#fff"/></svg>
+        </span>
+        {{ site_title|default('Atomiser Site') }}
+      </a>
+    </div>
+    <div class="nav-links">
+      {% if user %}
+        <a href="/">Feed</a>
+        <a href="/profile" class="nav-account">My profile</a>
+        {% if user.role == 'admin' or user.role == 'configurator' %}
+          <a href="/admin/">Admin</a>
+        {% endif %}
+        <a href="/auth/logout">Sign out</a>
+        <a href="/upload" class="nav-cta">+ Upload</a>
+      {% else %}
+        <a href="/auth/login">Sign in</a>
+        <a href="/auth/login" class="nav-cta">Get started</a>
+      {% endif %}
+    </div>
+  </nav>
+
+  <main class="container">
+    {% if request.query_params.success %}
+      <div class="alert alert-success">Saved successfully.</div>
+    {% endif %}
+    {% if error %}
+      <div class="alert alert-error">{{ error }}</div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <small>Atomiser — private community video hosting</small>
+  </footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

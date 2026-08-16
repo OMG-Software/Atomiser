@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Users — {{ site_title|default('Atomiser Site') }}{% endblock %}
+{% block content %}
+<h1>Users</h1>
+
+<table>
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Email</th>
+      <th>Display name</th>
+      <th>Role</th>
+      <th>2FA</th>
+      <th>Joined</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for u in users %}
+      <tr>
+        <td>{{ u.id }}</td>
+        <td>{{ u.email }}</td>
+        <td>{{ u.display_name or '—' }}</td>
+        <td>
+          {{ u.role }}
+          {% if u.is_bootstrap %}<span class="badge badge-info" title="Bootstrap account — role cannot be changed">bootstrap</span>{% endif %}
+        </td>
+        <td>{% if u.totp_enabled %}✓{% else %}—{% endif %}</td>
+        <td>{{ u.created_at }}</td>
+        <td>
+          {% if user.role == 'configurator' and u.id != user.id and u.role != 'configurator' and not u.is_bootstrap %}
+            <form method="POST" action="/admin/users/{{ u.id }}/role" class="inline-form">
+              <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+              <select name="role">
+                <option value="member" {% if u.role == 'member' %}selected{% endif %}>Member</option>
+                <option value="admin" {% if u.role == 'admin' %}selected{% endif %}>Admin</option>
+              </select>
+              <button type="submit" class="btn btn-small">Update</button>
+            </form>
+          {% endif %}
+          {% if u.id != user.id and not u.is_bootstrap %}
+            <form method="POST" action="/admin/users/{{ u.id }}/reset-password" style="display:inline;" onsubmit="return confirm('Reset this user\\'s password to a new random one? The new password will be shown once.')">
+              <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+              <button type="submit" class="btn btn-secondary btn-small">Reset password</button>
+            </form>
+            <form method="POST" action="/admin/users/{{ u.id }}/delete" style="display:inline;" onsubmit="return confirm('Delete this user and all their videos?')">
+              <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+              <button type="submit" class="btn btn-danger">Delete</button>
+            </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

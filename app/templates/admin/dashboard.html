@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Admin — {{ site_title|default('Atomiser Site') }}{% endblock %}
+{% block content %}
+<h1>Admin dashboard</h1>
+
+<div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));">
+  <div class="card">
+    <strong>{{ stats.users }}</strong>
+    <div class="meta">Users</div>
+    <a href="/admin/users">Manage →</a>
+  </div>
+  <div class="card">
+    <strong>{{ stats.videos }}</strong>
+    <div class="meta">Videos</div>
+    <a href="/admin/videos">Manage →</a>
+  </div>
+  <div class="card">
+    <strong>{{ stats.active_invites }}</strong>
+    <div class="meta">Active invites</div>
+    <a href="/invites">Invites →</a>
+  </div>
+  {% if user.role == 'configurator' %}
+    <div class="card">
+      <strong>⚙</strong>
+      <div class="meta">Site settings</div>
+      <a href="/admin/settings">Configure →</a>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

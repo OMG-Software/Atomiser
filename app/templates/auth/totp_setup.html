@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Two-factor authentication — {{ site_title|default('Atomiser Site') }}{% endblock %}
+{% block content %}
+<div class="card" style="max-width: 480px; margin: 2rem auto;">
+  <h1>Two-factor authentication</h1>
+
+  {% if enabled %}
+    <div class="alert alert-success">TOTP two-factor authentication is enabled on this account.</div>
+  {% else %}
+    <p>Scan this QR code in your authenticator app, then enter the 6-digit code below to enable 2FA.</p>
+
+    <div style="text-align: center; margin: 1rem 0;">
+      <img src="data:image/png;base64,{{ qr }}" alt="TOTP QR code" style="max-width: 200px; border-radius: var(--radius);">
+    </div>
+
+    <p class="meta">Manual secret: <code>{{ secret }}</code></p>
+
+    <form method="POST" action="/auth/totp/setup">
+      <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+      <label for="code">Verification code</label>
+      <input type="text" id="code" name="code" inputmode="numeric" pattern="\d{6}" required autofocus>
+      <button type="submit" class="btn">Enable 2FA</button>
+    </form>
+  {% endif %}
+</div>
+{% endblock %}

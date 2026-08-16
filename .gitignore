@@ -1,0 +1,38 @@
+# Secrets — never commit. The server keeps its own .env.
+.env
+.env.local
+*.pem
+*.key
+
+# Runtime data: SQLite database (real user accounts, Argon2 hashes, TOTP
+# secrets, session and invite token hashes) and uploaded/transcoded media.
+data/
+uploads/
+
+# Debug artifacts (see scripts/make_deploy_zip.py for the same policy).
+# Leading * matters: reg_cookies.txt would not match a bare "cookies*.txt".
+*cookies*.txt
+test_video.mp4
+
+# Deploy archives built by scripts/make_deploy_zip.py
+atomiser-deploy-*.zip
+*.zip
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local agent overrides (plans under .claude/plans/ are kept)
+.claude/settings.local.json
