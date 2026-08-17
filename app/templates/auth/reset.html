@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Set a new password — {{ site_title|default('Atomiser Site') }}{% endblock %}
+{% block content %}
+<div class="card auth-card">
+  <h1>Set a new password</h1>
+
+  {% if not valid %}
+    <div class="alert alert-error" style="margin-top:1rem;">
+      This reset link is invalid, has already been used, or has expired.
+    </div>
+    <p class="meta">
+      <a href="/auth/forgot">Request a new link</a> · <a href="/auth/login">Back to sign in</a>
+    </p>
+
+  {% else %}
+    <p class="meta" style="margin-bottom:0.5rem;">Choose a new password for your account.</p>
+
+    {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+
+    <form method="POST" action="/auth/reset">
+      <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+      <input type="hidden" name="token" value="{{ token }}">
+
+      <label for="password">New password</label>
+      <input type="password" id="password" name="password" required minlength="12"
+             autocomplete="new-password" autofocus>
+
+      <label for="confirm_password">Confirm new password</label>
+      <input type="password" id="confirm_password" name="confirm_password" required minlength="12"
+             autocomplete="new-password">
+
+      <p class="field-hint">At least 12 characters, including letters and digits.</p>
+      <p class="field-hint">Setting a new password signs you out of every device.</p>
+
+      <button type="submit" class="btn btn-block" style="margin-top:1.25rem;">Set new password</button>
+    </form>
+  {% endif %}
+</div>
+{% endblock %}

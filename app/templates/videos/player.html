@@ -1,14 +1,87 @@
 {% extends "base.html" %}
 {% block title %}{{ video.title }} — {{ site_title|default('Atomiser Site') }}{% endblock %}
 {% block content %}
-<div class="player-shell">
-  <video class="video-player" controls preload="metadata" poster="{% if video.thumbnail_path %}/thumb/{{ video.uuid }}{% endif %}">
-    {% for r in renditions %}
-      <source src="/stream/{{ video.uuid }}/{{ r.file_path.split('/')[-1] }}" type="video/mp4" data-label="{{ r.label }}">
-    {% endfor %}
-    Your browser does not support the video tag.
-  </video>
-</div>
+{% if renditions %}
+  <div class="player-shell">
+    {# One src, not three <source> elements: a browser picks the first source
+       it *supports*, and since every rendition is video/mp4 that always meant
+       720p. The quality selector below switches src explicitly. #}
+    <video id="video-player"
+           class="video-player"
+           controls
+           preload="metadata"
+           src="/stream/{{ video.uuid }}/{{ renditions[0].filename }}"
+           data-initial-label="{{ renditions[0].label }}"
+           poster="{% if video.thumbnail_path %}/thumb/{{ video.uuid }}{% endif %}">
+      Your browser does not support the video tag.
+    </video>
+  </div>
+
+  {% if renditions|length > 1 %}
+    <div class="player-quality">
+      <label for="quality-select">Quality</label>
+      <select id="quality-select">
+        {% for r in renditions %}
+          <option value="/stream/{{ video.uuid }}/{{ r.filename }}"
+                  data-label="{{ r.label }}"
+                  {% if loop.first %}selected{% endif %}>
+            {{ r.label }}{% if r.size_bytes %} · {{ (r.size_bytes / 1048576)|round(1) }} MB{% endif %}
+          </option>
+        {% endfor %}
+      </select>
+      <span class="meta" id="quality-note"></span>
+    </div>
+  {% endif %}
+
+{% elif video.status == 'failed' %}
+  <div class="empty-state">
+    <h2>This video could not be processed</h2>
+    <p>Transcoding failed{% if progress.attempts %} after {{ progress.attempts }} attempt{{ 's' if progress.attempts != 1 }}{% endif %}.
+       {% if is_owner %}Try uploading the file again, or ask an admin to retry it.{% else %}An admin can retry it from the admin panel.{% endif %}</p>
+    {% if is_admin and progress.last_error %}
+      <p class="meta" style="margin-top:1rem; word-break:break-word;"><code>{{ progress.last_error }}</code></p>
+    {% endif %}
+    {% if is_admin %}
+      <form method="POST" action="/admin/videos/{{ video.uuid }}/retry" style="margin-top:1rem;">
+        <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="btn">Retry processing</button>
+      </form>
+    {% endif %}
+  </div>
+
+{% else %}
+  {# Still transcoding. Previously this rendered a <video> with no sources at
+     all — a black box with no explanation — so poll and swap in the player. #}
+  <div class="processing-panel" id="processing-panel" data-video-uuid="{{ video.uuid }}">
+    {% if video.thumbnail_path %}
+      <img class="processing-poster" src="/thumb/{{ video.uuid }}" alt="">
+    {% endif %}
+    <div class="processing-body">
+      <h2>Processing your video…</h2>
+      <p class="meta" id="processing-message">
+        We're preparing the quality options. This usually takes a few minutes for a longer video —
+        you can safely leave this page and come back.
+      </p>
+      <div class="upload-progress" style="margin-top:1rem;">
+        <div class="upload-progress-track">
+          <div class="upload-progress-bar{% if not progress.total %} indeterminate{% endif %}"
+               id="processing-bar"
+               style="width: {{ progress.percent }}%"></div>
+        </div>
+        <div class="upload-progress-meta">
+          <span id="processing-status">
+            {% if progress.total %}
+              {{ progress.ready }} of {{ progress.total }} quality levels ready
+            {% else %}
+              Queued
+            {% endif %}
+          </span>
+          <span id="processing-percent">{% if progress.total %}{{ progress.percent }}%{% endif %}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endif %}
 
 <div class="player-info">
   <h1>{{ video.title }}</h1>
@@ -41,10 +114,27 @@
           <label for="description">Description</label>
           <textarea id="description" name="description" maxlength="5000" rows="4">{{ video.description or '' }}</textarea>
 
-          <button type="submit" class="btn">Save changes</button>
+          <label for="visibility">Visibility</label>
+          <select id="visibility" name="visibility">
+            <option value="site" {% if video.visibility == 'site' %}selected{% endif %}>Visible to everyone on the site</option>
+            <option value="private" {% if video.visibility == 'private' %}selected{% endif %}>Only me and admins</option>
+          </select>
+
+          <button type="submit" class="btn" style="margin-top:1.25rem;">Save changes</button>
         </form>
       </details>
+
+      <form method="POST"
+            action="/videos/{{ video.uuid }}/delete"
+            data-confirm="Delete this video permanently? The original, every quality version and the thumbnail will be removed.">
+        <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="btn btn-danger btn-small">Delete video</button>
+      </form>
     </div>
   {% endif %}
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='/js/player.js') }}?v={{ asset_version('js/player.js') }}"></script>
 {% endblock %}

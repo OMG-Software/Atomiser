@@ -20,6 +20,7 @@ from fido2.webauthn import (
 from fido2.utils import websafe_decode, websafe_encode
 from starlette.concurrency import run_in_threadpool
 
+from app import mail, ratelimit
 from app.config import Config
 from app.db import get_db
 from app.models import LoginForm, RegisterForm, TOTPChallengeForm
@@ -240,8 +241,30 @@ async def _audit(db, user_id: Optional[int], action: str, target_type: str = Non
 
 
 @router.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request, next: str = "/"):
-    return templates.TemplateResponse("auth/login.html", {"request": request, "next": _safe_next_url(next)})
+async def login_page(request: Request, next: str = "/", db=Depends(get_db)):
+    return templates.TemplateResponse(
+        "auth/login.html",
+        {
+            "request": request,
+            "next": _safe_next_url(next),
+            "site_title": await _site_title(db),
+            "mail_enabled": mail.mail_enabled(),
+        },
+    )
+
+
+async def _login_error(request, db, message: str, next_url: str, status_code: int):
+    return templates.TemplateResponse(
+        "auth/login.html",
+        {
+            "request": request,
+            "error": message,
+            "next": next_url,
+            "site_title": await _site_title(db),
+            "mail_enabled": mail.mail_enabled(),
+        },
+        status_code=status_code,
+    )
 
 
 @router.post("/login")
@@ -259,25 +282,44 @@ async def login_post(
     if not verify_csrf(csrf, cookie_csrf):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
 
+    client_ip = await _client_host(request)
+
+    # Throttle before touching the password hash: Argon2 verification is
+    # deliberately expensive, so an unthrottled endpoint is also a cheap way to
+    # burn the server's CPU.
+    wait_minutes = await ratelimit.retry_after_minutes(db, ratelimit.SCOPE_LOGIN, email=email, ip=client_ip)
+    if wait_minutes:
+        await _audit(db, None, "login_throttled", target_type="email", target_id=email, request=request)
+        return await _login_error(
+            request, db, ratelimit.throttle_message(wait_minutes), next,
+            status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+
     user = await _get_user_by_email(db, email)
     if not user or not await verify_password(password, user["password_hash"]):
         await _audit(db, user["id"] if user else None, "login_failed", request=request)
-        return templates.TemplateResponse(
-            "auth/login.html",
-            {"request": request, "error": "Invalid email or password", "next": next},
-            status_code=status.HTTP_401_UNAUTHORIZED,
+        await ratelimit.record_failure(db, ratelimit.SCOPE_LOGIN, email=email, ip=client_ip)
+        await ratelimit.apply_lockout(db, email)
+        return await _login_error(
+            request, db, "Invalid email or password", next, status.HTTP_401_UNAUTHORIZED,
         )
 
     if user["totp_enabled"]:
         totp = pyotp.TOTP(user.get("totp_secret") or "")
         if not totp.verify(totp_code.strip(), valid_window=1):
-            return templates.TemplateResponse(
-                "auth/login.html",
-                {"request": request, "error": "Invalid two-factor code", "next": next},
-                status_code=status.HTTP_401_UNAUTHORIZED,
+            # A wrong second factor counts as a failed attempt too, otherwise
+            # the code itself could be brute-forced once a password is known.
+            await ratelimit.record_failure(db, ratelimit.SCOPE_LOGIN, email=email, ip=client_ip)
+            await ratelimit.apply_lockout(db, email)
+            return await _login_error(
+                request, db, "Invalid two-factor code", next, status.HTTP_401_UNAUTHORIZED,
             )
 
-    token = await create_session(db, user["id"], await _client_host(request), request.headers.get("user-agent"))
+    await ratelimit.clear_failures(db, ratelimit.SCOPE_LOGIN, email=email)
+    await ratelimit.unlock(db, email)
+    await ratelimit.prune(db)
+
+    token = await create_session(db, user["id"], client_ip, request.headers.get("user-agent"))
     await _audit(db, user["id"], "login", request=request)
     resp = RedirectResponse(url=_safe_next_url(next), status_code=303)
     _set_session_cookie(resp, token)
@@ -314,14 +356,30 @@ async def register_post(
     if not verify_csrf(csrf, cookie_csrf):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
 
+    # Throttle invite-token guessing from a single source.
+    client_ip = await _client_host(request)
+    wait_minutes = await ratelimit.retry_after_minutes(db, ratelimit.SCOPE_REGISTER, ip=client_ip)
+    if wait_minutes:
+        return templates.TemplateResponse(
+            "auth/register.html",
+            {"request": request, "error": ratelimit.throttle_message(wait_minutes), "token": token},
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+
     token_hash = hash_token(token.strip())
     cursor = await db.execute(
-        "SELECT id, max_uses, used_count, expires_at FROM invites WHERE token_hash = ?",
+        "SELECT id, max_uses, used_count, expires_at, revoked_at FROM invites WHERE token_hash = ?",
         (token_hash,),
     )
     invite = await cursor.fetchone()
     now = now_utc()
-    if not invite or invite["used_count"] >= invite["max_uses"] or datetime.fromisoformat(invite["expires_at"]) < now:
+    if (
+        not invite
+        or invite["revoked_at"]
+        or invite["used_count"] >= invite["max_uses"]
+        or datetime.fromisoformat(invite["expires_at"]) < now
+    ):
+        await ratelimit.record_failure(db, ratelimit.SCOPE_REGISTER, ip=client_ip)
         return templates.TemplateResponse(
             "auth/register.html",
             {"request": request, "error": "Invite link is invalid, already used, or expired", "token": token},
@@ -351,7 +409,8 @@ async def register_post(
     # sharing a multi-use invite from both consuming the last use. The pre-check
     # above only gives a friendly error message; this is what enforces max_uses.
     cursor = await db.execute(
-        "UPDATE invites SET used_count = used_count + 1 WHERE id = ? AND used_count < max_uses",
+        "UPDATE invites SET used_count = used_count + 1 "
+        "WHERE id = ? AND used_count < max_uses AND revoked_at IS NULL",
         (invite["id"],),
     )
     if cursor.rowcount != 1:
@@ -378,6 +437,183 @@ async def register_post(
     resp = RedirectResponse(url="/", status_code=303)
     _set_session_cookie(resp, session_token)
     return resp
+
+
+# ---------------------------------------------------------------------------
+# Password reset (self-service, requires SMTP)
+# ---------------------------------------------------------------------------
+#
+# Without SMTP configured these pages explain that an admin has to reset the
+# password instead — the behaviour the site had before. With SMTP configured a
+# user can recover on their own using a single-use, time-limited token. Only the
+# token's hash is stored, and the response never reveals whether an address is
+# registered.
+
+@router.get("/forgot", response_class=HTMLResponse)
+async def forgot_page(request: Request, db=Depends(get_db)):
+    return templates.TemplateResponse(
+        "auth/forgot.html",
+        {
+            "request": request,
+            "mail_enabled": mail.mail_enabled(),
+            "site_title": await _site_title(db),
+        },
+    )
+
+
+@router.post("/forgot")
+async def forgot_post(
+    request: Request,
+    email: str = Form(...),
+    db=Depends(get_db),
+):
+    # CSRF is read from the form body rather than declared as a Form param so a
+    # missing token returns 403 like the other state-changing routes, not a 422.
+    form = await request.form()
+    if not verify_csrf(form.get("csrf", ""), request.cookies.get(CSRF_COOKIE)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
+
+    site_title = await _site_title(db)
+    context = {"request": request, "mail_enabled": mail.mail_enabled(), "site_title": site_title}
+
+    if not mail.mail_enabled():
+        return templates.TemplateResponse(
+            "auth/forgot.html",
+            {**context, "error": "Password recovery by email is not available on this site. Please ask an admin to reset your password."},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    client_ip = await _client_host(request)
+    wait_minutes = await ratelimit.retry_after_minutes(db, ratelimit.SCOPE_FORGOT, email=email, ip=client_ip)
+    if wait_minutes:
+        return templates.TemplateResponse(
+            "auth/forgot.html",
+            {**context, "error": ratelimit.throttle_message(wait_minutes)},
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+
+    # Every attempt is counted, whether or not the address exists, so the
+    # throttle cannot be used to probe for valid accounts either.
+    await ratelimit.record_failure(db, ratelimit.SCOPE_FORGOT, email=email, ip=client_ip)
+
+    user = await _get_user_by_email(db, email)
+    if user:
+        token = generate_token()
+        expires = now_utc() + timedelta(minutes=Config.PASSWORD_RESET_TTL_MINUTES)
+        # Invalidate any earlier outstanding link for this account.
+        await db.execute(
+            "UPDATE password_resets SET used_at = ? WHERE user_id = ? AND used_at IS NULL",
+            (now_utc().isoformat(), user["id"]),
+        )
+        await db.execute(
+            """
+            INSERT INTO password_resets (token_hash, user_id, expires_at, requested_ip)
+            VALUES (?, ?, ?, ?)
+            """,
+            (hash_token(token), user["id"], expires.isoformat(), client_ip),
+        )
+        await db.commit()
+        await _audit(db, user["id"], "password_reset_requested", request=request)
+
+        await mail.send_password_reset(
+            user["email"],
+            mail.absolute_url(request, f"/auth/reset?token={token}"),
+            site_title,
+            Config.PASSWORD_RESET_TTL_MINUTES,
+        )
+
+    # Identical response either way.
+    return templates.TemplateResponse(
+        "auth/forgot.html",
+        {**context, "sent": True},
+    )
+
+
+async def _reset_row(db, token: str):
+    """Return a usable reset row for a raw token, or None."""
+    if not token:
+        return None
+    cursor = await db.execute(
+        """
+        SELECT r.id, r.user_id, r.expires_at, r.used_at, u.email
+        FROM password_resets r JOIN users u ON r.user_id = u.id
+        WHERE r.token_hash = ?
+        """,
+        (hash_token(token.strip()),),
+    )
+    row = await cursor.fetchone()
+    if not row or row["used_at"]:
+        return None
+    if datetime.fromisoformat(row["expires_at"]) < now_utc():
+        return None
+    return row
+
+
+@router.get("/reset", response_class=HTMLResponse)
+async def reset_page(request: Request, token: str = "", db=Depends(get_db)):
+    row = await _reset_row(db, token)
+    return templates.TemplateResponse(
+        "auth/reset.html",
+        {
+            "request": request,
+            "token": token,
+            "valid": row is not None,
+            "site_title": await _site_title(db),
+        },
+        status_code=status.HTTP_200_OK if row else status.HTTP_400_BAD_REQUEST,
+    )
+
+
+@router.post("/reset")
+async def reset_post(
+    request: Request,
+    token: str = Form(...),
+    password: str = Form(...),
+    confirm_password: str = Form(...),
+    db=Depends(get_db),
+):
+    form = await request.form()
+    if not verify_csrf(form.get("csrf", ""), request.cookies.get(CSRF_COOKIE)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
+
+    site_title = await _site_title(db)
+    row = await _reset_row(db, token)
+    if not row:
+        return templates.TemplateResponse(
+            "auth/reset.html",
+            {"request": request, "token": token, "valid": False, "site_title": site_title},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    password = password.strip()
+    error = None
+    if password != confirm_password.strip():
+        error = "The two passwords do not match."
+    else:
+        error = password_policy_error(password)
+
+    if error:
+        return templates.TemplateResponse(
+            "auth/reset.html",
+            {"request": request, "token": token, "valid": True, "error": error, "site_title": site_title},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    await db.execute(
+        "UPDATE users SET password_hash = ?, locked_until = NULL WHERE id = ?",
+        (await hash_password(password), row["user_id"]),
+    )
+    await db.execute(
+        "UPDATE password_resets SET used_at = ? WHERE id = ?", (now_utc().isoformat(), row["id"])
+    )
+    # Anyone already signed in as this user is signed out: a password reset is
+    # exactly the moment you want existing sessions invalidated.
+    await db.execute("DELETE FROM sessions WHERE user_id = ?", (row["user_id"],))
+    await db.commit()
+    await ratelimit.clear_failures(db, ratelimit.SCOPE_LOGIN, email=row["email"])
+    await _audit(db, row["user_id"], "password_reset_completed", request=request)
+
+    return RedirectResponse(url="/auth/login?reset=1", status_code=303)
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +820,12 @@ async def passkey_login_options(request: Request, db=Depends(get_db)):
     if not email:
         return _json_error("Email required")
 
+    client_ip = await _client_host(request)
+    wait_minutes = await ratelimit.retry_after_minutes(db, ratelimit.SCOPE_PASSKEY, email=email, ip=client_ip)
+    if wait_minutes:
+        return _json_error(ratelimit.throttle_message(wait_minutes), status.HTTP_429_TOO_MANY_REQUESTS)
+    await ratelimit.record_failure(db, ratelimit.SCOPE_PASSKEY, email=email, ip=client_ip)
+
     user = await _get_user_by_email(db, email)
     allow_credentials = []
     if user:
@@ -601,8 +843,10 @@ async def passkey_login_options(request: Request, db=Depends(get_db)):
     temp_token = generate_token()
     token_hash = hash_token(temp_token)
     expires = now_utc() + timedelta(minutes=5)
+    # purpose='webauthn' keeps these short-lived challenge rows out of the
+    # session list on /profile and out of the admin session counts.
     await db.execute(
-        "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+        "INSERT INTO sessions (token_hash, user_id, expires_at, purpose) VALUES (?, ?, ?, 'webauthn')",
         (token_hash, user["id"] if user else -1, expires.isoformat()),
     )
     await db.execute(
@@ -668,6 +912,15 @@ async def passkey_login(request: Request, response: Response, db=Depends(get_db)
     session_token = await create_session(db, credential_row["user_id"], await _client_host(request), request.headers.get("user-agent"))
     _set_session_cookie(response, session_token)
     await _audit(db, credential_row["user_id"], "login_passkey", request=request)
+
+    # A completed passkey login clears the throttle counters for that account.
+    cursor = await db.execute("SELECT email FROM users WHERE id = ?", (credential_row["user_id"],))
+    row = await cursor.fetchone()
+    if row:
+        await ratelimit.clear_failures(db, ratelimit.SCOPE_PASSKEY, email=row["email"])
+        await ratelimit.clear_failures(db, ratelimit.SCOPE_LOGIN, email=row["email"])
+        await ratelimit.unlock(db, row["email"])
+
     return {"success": True}
 
 

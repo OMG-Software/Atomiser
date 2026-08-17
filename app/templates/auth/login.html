@@ -4,6 +4,11 @@
 <div class="card auth-card">
   <h1>Welcome back</h1>
   <p class="meta" style="margin-bottom:0.5rem;">Sign in to your account</p>
+
+  {% if request.query_params.get('reset') %}
+    <div class="alert alert-success">Your password has been changed. Sign in with your new password.</div>
+  {% endif %}
+
   <form method="POST" action="/auth/login">
     <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
     <input type="hidden" name="next" value="{{ next }}">
@@ -19,6 +24,10 @@
 
     <button type="submit" class="btn btn-block" style="margin-top:1.25rem;">Sign in</button>
   </form>
+
+  <p class="meta" style="margin-top:0.85rem; text-align:center;">
+    <a href="/auth/forgot">Forgotten your password?</a>
+  </p>
 
   <div class="auth-divider">or</div>
 

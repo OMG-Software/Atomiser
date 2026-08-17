@@ -513,3 +513,333 @@ async def test_register_concurrent_invite_not_exceeding_max_uses(client, db, csr
     cur = await db.execute("SELECT used_count FROM invites WHERE token_hash = ?", (token_hash,))
     row = await cur.fetchone()
     assert row["used_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting and account lockout
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def low_login_threshold(monkeypatch):
+    """Shrink the failure threshold so a test does not need dozens of requests."""
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "LOGIN_MAX_FAILURES_PER_EMAIL", 3)
+    monkeypatch.setattr(Config, "LOGIN_MAX_FAILURES_PER_IP", 100)
+    return Config
+
+
+async def _bad_login(client, csrf, email="member@example.com"):
+    return await client.post(
+        "/auth/login",
+        data={"email": email, "password": "WrongPassword123", "csrf": csrf, "next": "/"},
+        follow_redirects=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_failures_lock_the_account(client, csrf, member_user, low_login_threshold):
+    for _ in range(low_login_threshold.LOGIN_MAX_FAILURES_PER_EMAIL):
+        resp = await _bad_login(client, csrf)
+        assert resp.status_code == 401
+
+    # The next attempt is throttled rather than checked.
+    resp = await _bad_login(client, csrf)
+    assert resp.status_code == 429
+    assert "Too many attempts" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_lockout_blocks_the_correct_password_too(client, csrf, member_user, low_login_threshold):
+    """A lockout that the real password walks straight through is no lockout."""
+    for _ in range(low_login_threshold.LOGIN_MAX_FAILURES_PER_EMAIL):
+        await _bad_login(client, csrf)
+
+    resp = await client.post(
+        "/auth/login",
+        data={
+            "email": member_user["email"],
+            "password": member_user["password"],
+            "csrf": csrf,
+            "next": "/",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 429
+    assert "session" not in resp.cookies
+
+
+@pytest.mark.asyncio
+async def test_unknown_email_is_throttled_identically(client, csrf, low_login_threshold):
+    """Otherwise the throttle response itself reveals which accounts exist."""
+    for _ in range(low_login_threshold.LOGIN_MAX_FAILURES_PER_EMAIL):
+        resp = await _bad_login(client, csrf, email="nobody@example.com")
+        assert resp.status_code == 401
+
+    resp = await _bad_login(client, csrf, email="nobody@example.com")
+    assert resp.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_successful_login_clears_the_counter(client, csrf, member_user, low_login_threshold):
+    # Stay one below the threshold, then sign in successfully.
+    for _ in range(low_login_threshold.LOGIN_MAX_FAILURES_PER_EMAIL - 1):
+        await _bad_login(client, csrf)
+
+    resp = await client.post(
+        "/auth/login",
+        data={
+            "email": member_user["email"],
+            "password": member_user["password"],
+            "csrf": csrf,
+            "next": "/",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    async for db in __import__("app.db", fromlist=["get_db"]).get_db():
+        cursor = await db.execute(
+            "SELECT COUNT(*) AS c FROM login_attempts WHERE key_kind = 'email' AND key_value = ?",
+            (member_user["email"],),
+        )
+        assert (await cursor.fetchone())["c"] == 0
+        break
+
+
+@pytest.mark.asyncio
+async def test_rate_limiting_can_be_disabled(client, csrf, member_user, monkeypatch):
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "RATE_LIMIT_ENABLED", False)
+    monkeypatch.setattr(Config, "LOGIN_MAX_FAILURES_PER_EMAIL", 2)
+
+    for _ in range(4):
+        resp = await _bad_login(client, csrf)
+        assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Password reset
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_forgot_page_explains_when_mail_is_off(client):
+    resp = await client.get("/auth/forgot")
+    assert resp.status_code == 200
+    assert "does not send email" in resp.text
+    assert 'name="email"' not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_forgot_post_refused_when_mail_is_off(client, csrf, member_user):
+    resp = await client.post(
+        "/auth/forgot", data={"email": member_user["email"], "csrf": csrf}
+    )
+    assert resp.status_code == 400
+    assert "not available" in resp.text
+
+
+@pytest.fixture
+def mail_configured(monkeypatch):
+    """Pretend SMTP is set up, but capture messages instead of sending them."""
+    from app import mail
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "SMTP_HOST", "smtp.example.com")
+    monkeypatch.setattr(Config, "SMTP_FROM", "atomiser@example.com")
+
+    sent = []
+
+    async def _capture(to_address, subject, body, site_title="Atomiser"):
+        sent.append({"to": to_address, "subject": subject, "body": body})
+        return True
+
+    monkeypatch.setattr(mail, "send_mail", _capture)
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_forgot_sends_a_reset_link(client, csrf, member_user, mail_configured, db):
+    resp = await client.post(
+        "/auth/forgot", data={"email": member_user["email"], "csrf": csrf}
+    )
+    assert resp.status_code == 200
+    assert len(mail_configured) == 1
+    assert "/auth/reset?token=" in mail_configured[0]["body"]
+
+    cursor = await db.execute("SELECT COUNT(*) AS c FROM password_resets")
+    assert (await cursor.fetchone())["c"] == 1
+
+
+@pytest.mark.asyncio
+async def test_forgot_response_is_identical_for_unknown_email(client, csrf, mail_configured, db):
+    resp = await client.post(
+        "/auth/forgot", data={"email": "nobody@example.com", "csrf": csrf}
+    )
+    assert resp.status_code == 200
+    assert "on its way" in resp.text
+    assert mail_configured == []
+
+    cursor = await db.execute("SELECT COUNT(*) AS c FROM password_resets")
+    assert (await cursor.fetchone())["c"] == 0
+
+
+def _token_from(body):
+    return body.split("/auth/reset?token=")[1].split()[0].strip()
+
+
+@pytest.mark.asyncio
+async def test_reset_token_sets_new_password(client, csrf, member_user, mail_configured, db):
+    await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
+    token = _token_from(mail_configured[0]["body"])
+
+    page = await client.get(f"/auth/reset?token={token}")
+    assert page.status_code == 200
+
+    resp = await client.post(
+        "/auth/reset",
+        data={
+            "token": token,
+            "password": "BrandNewPass12345",
+            "confirm_password": "BrandNewPass12345",
+            "csrf": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    login = await client.post(
+        "/auth/login",
+        data={
+            "email": member_user["email"],
+            "password": "BrandNewPass12345",
+            "csrf": csrf,
+            "next": "/",
+        },
+        follow_redirects=False,
+    )
+    assert login.status_code == 303
+
+
+@pytest.mark.asyncio
+async def test_reset_token_is_single_use(client, csrf, member_user, mail_configured):
+    await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
+    token = _token_from(mail_configured[0]["body"])
+
+    payload = {
+        "token": token,
+        "password": "BrandNewPass12345",
+        "confirm_password": "BrandNewPass12345",
+        "csrf": csrf,
+    }
+    first = await client.post("/auth/reset", data=payload, follow_redirects=False)
+    assert first.status_code == 303
+
+    second = await client.post("/auth/reset", data=payload, follow_redirects=False)
+    assert second.status_code == 400
+    assert "invalid" in second.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_expired_reset_token_is_rejected(client, csrf, member_user, mail_configured, db):
+    from datetime import timedelta
+
+    from app.utils import now_utc
+
+    await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
+    token = _token_from(mail_configured[0]["body"])
+
+    await db.execute(
+        "UPDATE password_resets SET expires_at = ?",
+        ((now_utc() - timedelta(minutes=1)).isoformat(),),
+    )
+    await db.commit()
+
+    resp = await client.post(
+        "/auth/reset",
+        data={
+            "token": token,
+            "password": "BrandNewPass12345",
+            "confirm_password": "BrandNewPass12345",
+            "csrf": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_reset_rejects_weak_password(client, csrf, member_user, mail_configured):
+    await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
+    token = _token_from(mail_configured[0]["body"])
+
+    resp = await client.post(
+        "/auth/reset",
+        data={"token": token, "password": "short", "confirm_password": "short", "csrf": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert "12 characters" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_reset_rejects_mismatched_confirmation(client, csrf, member_user, mail_configured):
+    await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
+    token = _token_from(mail_configured[0]["body"])
+
+    resp = await client.post(
+        "/auth/reset",
+        data={
+            "token": token,
+            "password": "BrandNewPass12345",
+            "confirm_password": "DifferentPass12345",
+            "csrf": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert "do not match" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_reset_revokes_existing_sessions(client, csrf, member_user, mail_configured, db):
+    """A reset is exactly when you want other sessions killed."""
+    from app.auth import create_session
+
+    cursor = await db.execute("SELECT id FROM users WHERE email = ?", (member_user["email"],))
+    user_id = (await cursor.fetchone())["id"]
+    await create_session(db, user_id, "10.0.0.9", "stale device")
+
+    await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
+    token = _token_from(mail_configured[0]["body"])
+    await client.post(
+        "/auth/reset",
+        data={
+            "token": token,
+            "password": "BrandNewPass12345",
+            "confirm_password": "BrandNewPass12345",
+            "csrf": csrf,
+        },
+        follow_redirects=False,
+    )
+
+    cursor = await db.execute("SELECT COUNT(*) AS c FROM sessions WHERE user_id = ?", (user_id,))
+    assert (await cursor.fetchone())["c"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reset_requires_csrf(client, member_user, mail_configured, csrf):
+    await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
+    token = _token_from(mail_configured[0]["body"])
+
+    resp = await client.post(
+        "/auth/reset",
+        data={
+            "token": token,
+            "password": "BrandNewPass12345",
+            "confirm_password": "BrandNewPass12345",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 403

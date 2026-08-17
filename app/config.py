@@ -14,6 +14,14 @@ def _env(key: str, default=None, required: bool = False):
     return value
 
 
+def _env_bool(key: str, default: str) -> bool:
+    return _env(key, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(key: str, default: str) -> int:
+    return int(_env(key, default))
+
+
 class Config:
     # Reserved for future cryptographic signing (e.g., signed session cookies).
     # Currently session and CSRF tokens are generated with secrets.token_urlsafe
@@ -27,7 +35,56 @@ class Config:
     PORT: int = int(_env("PORT", "8000"))
     PRODUCTION: bool = ENV == "production"
     WEBAUTHN_RP_ID: str = _env("WEBAUTHN_RP_ID", "localhost")
-    TRANSCODE_VIDEOS: bool = _env("TRANSCODE_VIDEOS", "true").lower() in ("1", "true", "yes")
+    TRANSCODE_VIDEOS: bool = _env_bool("TRANSCODE_VIDEOS", "true")
+
+    # Absolute base URL used when a link has to be built outside a request
+    # (password reset and invite emails). Falls back to the request's own base
+    # URL when a request is available.
+    SITE_URL: str = _env("SITE_URL", "").rstrip("/")
+
+    # --- Transcoding worker -------------------------------------------------
+    # Number of videos transcoded at once. 1 keeps ffmpeg from starving the web
+    # worker; raise it only on a box with cores to spare.
+    TRANSCODE_CONCURRENCY: int = max(1, _env_int("TRANSCODE_CONCURRENCY", "1"))
+    # A job is retried this many times before it is marked failed for good.
+    TRANSCODE_MAX_ATTEMPTS: int = max(1, _env_int("TRANSCODE_MAX_ATTEMPTS", "3"))
+    # Delete the original upload once at least one rendition is ready. The raw
+    # file is roughly as large as all renditions combined, so keeping it doubles
+    # storage per video. Set true only if you want the pristine original back.
+    KEEP_RAW_UPLOADS: bool = _env_bool("KEEP_RAW_UPLOADS", "false")
+    # Set false to run the worker as a separate process (see docs/DEPLOYMENT.md)
+    # instead of inside the web app.
+    RUN_TRANSCODE_WORKER: bool = _env_bool("RUN_TRANSCODE_WORKER", "true")
+
+    # --- Rate limiting ------------------------------------------------------
+    # Portable, in-app throttling so protection does not depend on the nginx
+    # config being present. Window is in seconds.
+    RATE_LIMIT_ENABLED: bool = _env_bool("RATE_LIMIT_ENABLED", "true")
+    RATE_LIMIT_WINDOW_SECONDS: int = max(1, _env_int("RATE_LIMIT_WINDOW_SECONDS", "900"))
+    # Failed logins per email before the account is locked for the window.
+    LOGIN_MAX_FAILURES_PER_EMAIL: int = max(1, _env_int("LOGIN_MAX_FAILURES_PER_EMAIL", "8"))
+    # Failed logins per source IP before that IP is throttled.
+    LOGIN_MAX_FAILURES_PER_IP: int = max(1, _env_int("LOGIN_MAX_FAILURES_PER_IP", "25"))
+    LOCKOUT_MINUTES: int = max(1, _env_int("LOCKOUT_MINUTES", "15"))
+
+    # --- Outbound email (optional) -----------------------------------------
+    # With SMTP_HOST unset the app behaves exactly as before: invites are
+    # copy-paste links and password recovery tells the user to contact an admin.
+    SMTP_HOST: str = _env("SMTP_HOST", "")
+    SMTP_PORT: int = _env_int("SMTP_PORT", "587")
+    SMTP_USERNAME: str = _env("SMTP_USERNAME", "")
+    SMTP_PASSWORD: str = _env("SMTP_PASSWORD", "")
+    SMTP_STARTTLS: bool = _env_bool("SMTP_STARTTLS", "true")
+    SMTP_SSL: bool = _env_bool("SMTP_SSL", "false")
+    SMTP_FROM: str = _env("SMTP_FROM", "")
+    SMTP_TIMEOUT: int = max(1, _env_int("SMTP_TIMEOUT", "20"))
+    # Password reset links are short-lived by design.
+    PASSWORD_RESET_TTL_MINUTES: int = max(1, _env_int("PASSWORD_RESET_TTL_MINUTES", "60"))
+
+    @classmethod
+    def mail_enabled(cls) -> bool:
+        """True when enough SMTP settings are present to attempt delivery."""
+        return bool(cls.SMTP_HOST and cls.SMTP_FROM)
 
     @classmethod
     def ensure_dirs(cls):

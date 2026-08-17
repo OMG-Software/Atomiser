@@ -29,20 +29,24 @@ All video content is authenticated: only logged-in users can upload, view, or br
 ```
 Atomiser/
 ├── app/
-│   ├── main.py              # FastAPI app factory, routers, error handlers
+│   ├── main.py              # FastAPI app factory, routers, error handlers, lifespan
 │   ├── config.py            # Settings loaded from .env; BASE_DIR helper
 │   ├── db.py                # aiosqlite connection + migration runner
 │   ├── models.py            # Pydantic forms and request models
-│   ├── auth.py              # Passwords, sessions, TOTP, WebAuthn, login routes
+│   ├── auth.py              # Passwords, sessions, TOTP, WebAuthn, login, password reset
 │   ├── roles.py             # Role enum and role-check helpers
-│   ├── users.py             # Profile routes
-│   ├── videos.py            # Upload, transcode, feed, player, streaming
-│   ├── admin.py             # Admin + Configurator dashboard routes
-│   ├── invites.py           # Invite generation routes
+│   ├── users.py             # Profile and session-management routes
+│   ├── videos.py            # Upload, transcode, feed, player, streaming, file cleanup
+│   ├── jobs.py              # Durable transcode queue and worker pool
+│   ├── mail.py              # Optional SMTP delivery (no-op when unconfigured)
+│   ├── ratelimit.py         # Sliding-window auth throttling and account lockout
+│   ├── admin.py             # Admin + Configurator dashboard, audit viewer
+│   ├── invites.py           # Invite generation, revocation
 │   ├── utils.py             # Tokens, CSRF, UUID helpers
 │   ├── templates/           # Jinja2 templates
 │   └── static/              # CSS, JS, images
-├── db/migrations/           # Ordered .sql migration files
+├── db/migrations/           # Ordered .sql migration files (new tables only;
+│                            # column additions live in db.py's _ADDED_COLUMNS)
 ├── scripts/
 │   ├── bootstrap.py         # Create the first (immutable) Configurator
 │   ├── migrate_bootstrap.py # Idempotent is_bootstrap column helper
@@ -52,7 +56,8 @@ Atomiser/
 │   └── atomiser.service     # systemd unit example
 ├── uploads/                 # raw/ and videos/ subdirs (created at runtime)
 ├── data/                    # SQLite database directory
-├── tests/                   # pytest suite covering auth, TOTP, passkeys, roles, invites, bootstrap, videos, settings
+├── tests/                   # pytest suite covering auth, TOTP, passkeys, roles,
+│                            # invites, bootstrap, videos, jobs, settings
 ├── requirements.txt
 ├── .env.example
 ├── docs/
@@ -104,7 +109,26 @@ Use `require_role(user, Role.ADMIN)` or `Role.CONFIGURATOR` in routes. `require_
 - Uploaded files are saved to `uploads/raw/<uuid>.<ext>`. Original extension is preserved only on the raw file.
 - Transcoding produces 720p, 480p, and 360p H.264 MP4s with a midpoint thumbnail. Renditions are stored in `uploads/videos/<video_uuid>/`.
 - `videos.py` has `RENDITIONS` and `ALLOWED_TYPES` constants for quick changes.
-- Streaming is done via `/watch/<uuid>` (HTML player) and `/video/stream/<uuid>/<label>` (the actual file). The stream endpoint sets `X-Accel-Redirect`; nginx handles the byte range serving.
+- Streaming is done via `/videos/<uuid>` (HTML player) and `/stream/<uuid>/<filename>` (the actual file). The stream endpoint sets `X-Accel-Redirect`; nginx handles the byte range serving.
+- **Never emit several same-type `<source>` elements.** A browser plays the first source it *supports*, so three `video/mp4` sources always meant only 720p was ever served. The player ships one `src` plus a quality selector in `static/js/player.js`.
+- Rendition filenames are derived server-side with `Path(...).name`, not by splitting `file_path` on `/` in a template — `file_path` is OS-native and the template form breaks on Windows.
+- `purge_video_files()` in `videos.py` removes the original, every rendition, the thumbnail and the per-video directory. Call it from anything that deletes a video; deleting only the DB row leaks the media forever.
+- The original upload is deleted once a rendition succeeds unless `KEEP_RAW_UPLOADS=true`, and `videos.raw_path` is set to NULL so storage totals stay accurate.
+
+### Background jobs
+
+- Transcoding is **not** a `BackgroundTasks` job. Uploads insert a row into `transcode_jobs` and a worker pool started in `main.py`'s lifespan picks it up.
+- `jobs.requeue_orphans()` runs at startup: it resets jobs left `running` by a crash and queues any video stuck in a pending status with no job row.
+- A job is claimed with a conditional `UPDATE ... WHERE status = 'queued'`; the `rowcount == 1` check is the concurrency gate. Do not replace it with a plain SELECT-then-UPDATE.
+- Failures retry up to `TRANSCODE_MAX_ATTEMPTS`, then mark the video `failed`.
+- Video status flows `uploading` → `processing` → `ready`/`failed`. The player polls `/videos/<uuid>/status` while it is not ready.
+
+### Email and rate limiting
+
+- `mail.py` is optional by design. `Config.mail_enabled()` is false unless both `SMTP_HOST` and `SMTP_FROM` are set, and every feature that uses mail must still work without it. `send_mail()` returns False on failure rather than raising.
+- Use `mail.absolute_url(request, path)` for links that leave the app; it prefers `SITE_URL` over the request's `Host` header.
+- `ratelimit.py` counts failures against the **submitted** email string, not a resolved user id, so an unknown address is throttled exactly like a real one. Keep it that way — the difference would be an account-enumeration oracle.
+- Throttle checks belong *before* the Argon2 verification, which is deliberately expensive.
 
 ## Environment and running locally
 
@@ -139,7 +163,9 @@ The production setup is documented in `README.md` and uses the nginx/systemd fil
 - **Template signature shim.** `TemplateResponse` accepts either signature; prefer the newer `(request, name, context)` form for new code, but existing routes use the old form.
 - **Module-level `templates` variable.** It is `None` until `main.py` assigns `auth.templates = app_templates`, etc. Do not try to render templates at import time.
 - **Database schema changes.** Add a new `.sql` file in `db/migrations/` rather than editing existing migration files; `init_db()` runs all scripts on every startup. Some migrations (such as adding `is_bootstrap`) are also handled by Python helpers in `app/db.py` because SQLite cannot express conditional `ALTER TABLE`.
-- **CSRF on every state-changing form.** Missing CSRF checks are a security bug, not a style issue.
+- **CSRF on every state-changing form.** Missing CSRF checks are a security bug, not a style issue. Read the token from the form body (`form.get("csrf", "")`) rather than declaring `csrf: str = Form(...)`, so a missing token returns 403 instead of a 422 validation error.
+- **No inline event handlers.** The CSP is `script-src 'self'` with no `'unsafe-inline'`, so `onsubmit="return confirm(...)"` silently does nothing in production — the form just submits. Use `data-confirm="…"` on the form; `static/js/confirm.js` handles it globally.
+- **Adding a column?** SQLite has no `ADD COLUMN IF NOT EXISTS`. Add it to `_ADDED_COLUMNS` in `app/db.py` rather than to a `.sql` file, which would fail on the second startup. New *tables* still go in a migration with `CREATE TABLE IF NOT EXISTS`.
 - **File paths.** Always use `Config.UPLOAD_DIR`, `Config.DATABASE_PATH`, or `BASE_DIR` from `config.py`; never hard-code filesystem paths.
 - **Role comparisons.** Always compare roles via `ROLE_RANK` / `has_role()`; do not compare role strings directly.
 

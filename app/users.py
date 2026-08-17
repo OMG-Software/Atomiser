@@ -4,6 +4,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from app.auth import (
     require_user,
     CSRF_COOKIE,
+    SESSION_COOKIE,
     verify_csrf,
     get_current_user,
     hash_password,
@@ -13,6 +14,7 @@ from app.auth import (
 )
 from app.db import get_db
 from app.roles import Role, has_role
+from app.utils import now_utc
 
 router = APIRouter(tags=["users"])
 
@@ -39,12 +41,32 @@ async def _own_videos(db, user_id: int) -> list:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def _active_sessions(db, user_id: int) -> list:
+    """Live login sessions for a user, most recently used first.
+
+    WebAuthn challenge rows share the sessions table but are not logins, so
+    they are filtered out by purpose.
+    """
+    cursor = await db.execute(
+        """
+        SELECT id, created_at, last_used_at, expires_at, ip, user_agent
+        FROM sessions
+        WHERE user_id = ? AND purpose = 'session' AND expires_at > ?
+        ORDER BY last_used_at DESC, id DESC
+        """,
+        (user_id, now_utc().isoformat()),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def _profile_context(db, user, **extra) -> dict:
     """Context for rendering the current user's own profile page."""
     return {
         "user": user,
         "profile_user": user,
         "videos": await _own_videos(db, user["id"]),
+        "sessions": await _active_sessions(db, user["id"]),
+        "current_session_id": user.get("session_id"),
         "site_title": await _site_title(db),
         **extra,
     }
@@ -125,6 +147,57 @@ async def update_profile(
     )
     await db.commit()
     return RedirectResponse(url="/profile", status_code=303)
+
+
+@router.post("/profile/sessions/{session_id}/revoke")
+async def revoke_session(
+    session_id: int,
+    request: Request,
+    user=Depends(require_user),
+    db=Depends(get_db),
+):
+    """Sign out one of your own sessions."""
+    form = await request.form()
+    if not verify_csrf(form.get("csrf", ""), request.cookies.get(CSRF_COOKIE)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
+
+    # Scoping the DELETE by user_id is what stops one user revoking another's
+    # session by guessing an id.
+    cursor = await db.execute(
+        "DELETE FROM sessions WHERE id = ? AND user_id = ?", (session_id, user["id"])
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+
+    await _audit(db, user["id"], "session_revoked", target_type="session", target_id=str(session_id), request=request)
+
+    # Revoking the session you are using is a logout.
+    if session_id == user.get("session_id"):
+        resp = RedirectResponse(url="/auth/login", status_code=303)
+        resp.delete_cookie(key=SESSION_COOKIE, path="/")
+        return resp
+    return RedirectResponse(url="/profile?sessions_revoked=1", status_code=303)
+
+
+@router.post("/profile/sessions/revoke-others")
+async def revoke_other_sessions(
+    request: Request,
+    user=Depends(require_user),
+    db=Depends(get_db),
+):
+    """Sign out every session except the one making this request."""
+    form = await request.form()
+    if not verify_csrf(form.get("csrf", ""), request.cookies.get(CSRF_COOKIE)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
+
+    cursor = await db.execute(
+        "DELETE FROM sessions WHERE user_id = ? AND id != ?",
+        (user["id"], user.get("session_id") or -1),
+    )
+    await db.commit()
+    await _audit(db, user["id"], "sessions_revoked", target_type="user", target_id=str(user["id"]), request=request)
+    return RedirectResponse(url=f"/profile?sessions_revoked={cursor.rowcount or 0}", status_code=303)
 
 
 @router.get("/u/{user_id}", response_class=HTMLResponse)

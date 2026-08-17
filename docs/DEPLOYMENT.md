@@ -118,12 +118,90 @@ MAX_UPLOAD_MB=500
 # Must match your public domain, or passkeys will not work.
 WEBAUTHN_RP_ID=example.com
 
+# Used to build links that leave the app (password reset and invite emails).
+SITE_URL=https://example.com
+
 # Not used in production because nginx talks to the unix socket, but keep sensible defaults.
 HOST=127.0.0.1
 PORT=8000
 ```
 
 `SECRET_KEY`, `WEBAUTHN_RP_ID`, and the database/upload paths are the most important changes from the development defaults.
+
+### Transcoding
+
+Transcoding runs as a durable job queue rather than an in-process background
+task, so a restart mid-transcode resumes on the next start instead of stranding
+the video. Relevant settings:
+
+```ini
+# Videos transcoded at once. 1 keeps ffmpeg from starving the web worker.
+TRANSCODE_CONCURRENCY=1
+
+# Retries before a video is marked failed for good.
+TRANSCODE_MAX_ATTEMPTS=3
+
+# Delete the original upload once a rendition succeeds. The original is roughly
+# as large as all renditions combined and is never served, so keeping it about
+# doubles storage per video.
+KEEP_RAW_UPLOADS=false
+```
+
+On a busy site you can move transcoding off the web service entirely: set
+`RUN_TRANSCODE_WORKER=false` in the web service's environment and run a second
+unit with it set to `true` that imports `app.jobs` and calls `start_workers()`.
+Both processes share the same SQLite database, and the conditional-UPDATE job
+claim means two workers never take the same job.
+
+> **Note:** with `KEEP_RAW_UPLOADS=false` a failed transcode can only be retried
+> while the original is still on disk — which it is, because the original is
+> deleted only after a rendition succeeds. Once a video is `ready` there is
+> nothing to reprocess, and the admin retry button reports that.
+
+### Rate limiting
+
+The nginx `limit_req` zones remain the first line of defence, but the app now
+also throttles the auth endpoints itself, so protection survives a proxy
+misconfiguration or a move to a different front end:
+
+```ini
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_WINDOW_SECONDS=900
+LOGIN_MAX_FAILURES_PER_EMAIL=8
+LOGIN_MAX_FAILURES_PER_IP=25
+LOCKOUT_MINUTES=15
+```
+
+The IP threshold is deliberately much higher than the email one, because a
+household or office behind one NAT address shares it.
+
+> **Important:** the IP-keyed limit is only meaningful if the app sees the real
+> client address. nginx must forward `X-Forwarded-For`/`X-Real-IP` (the shipped
+> config does), otherwise every request looks like it comes from one address.
+
+### Email (optional)
+
+Leave `SMTP_HOST` blank to run with no mail at all — invites are copy-paste
+links and passwords are reset by an admin, exactly as before. Setting both
+`SMTP_HOST` and `SMTP_FROM` additionally enables emailed invites and
+self-service password reset:
+
+```ini
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=atomiser@example.com
+SMTP_PASSWORD=<app-password>
+SMTP_FROM=Atomiser <atomiser@example.com>
+SMTP_STARTTLS=true
+SMTP_SSL=false
+PASSWORD_RESET_TTL_MINUTES=60
+```
+
+Use port 465 with `SMTP_SSL=true` and `SMTP_STARTTLS=false` for implicit TLS.
+Set `SITE_URL` too, so reset links are built from a value you control rather
+than the request's `Host` header. Send yourself a test invite from
+`/invites/` after enabling this; delivery failures are logged to the journal and
+never lose the invite, since the link is still shown on screen.
 
 ---
 
@@ -406,9 +484,38 @@ sudo setsebool -P httpd_read_user_content 1
   sudo -u atomiser ffprobe -version
   ```
 - Check disk space in `/opt/atomiser/uploads`.
-- Review the journal for Python exceptions from `app/videos.py`.
+- Review the journal for Python exceptions from `app/videos.py` or `app/jobs.py`.
 - Ensure the `atomiser` user has write permission to `/opt/atomiser/uploads/raw` and `/opt/atomiser/uploads/videos`.
 - Check SELinux denials if files cannot be written.
+- Check the queue. **Admin → dashboard** shows how many jobs are queued and lists
+  failed transcodes with the ffmpeg error and a retry button. From the shell:
+  ```bash
+  sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db \
+      "SELECT id, video_id, status, attempts, last_error FROM transcode_jobs ORDER BY id DESC LIMIT 20;"
+  ```
+- Confirm the worker started. The journal logs `Started N transcode worker(s)` at
+  boot; if it is missing, check `RUN_TRANSCODE_WORKER` is not set to false.
+
+### A video is stuck on "Processing"
+
+Jobs survive a restart, so this is almost always a real ffmpeg failure rather
+than a lost task. Check the failed-transcode list on the admin dashboard for the
+error, then retry it from there. A job left `running` by a hard kill is requeued
+automatically the next time the service starts.
+
+### A user is locked out
+
+Repeated failed sign-ins lock an account for `LOCKOUT_MINUTES`. The lock expires
+on its own; to clear it immediately, have the user complete a password reset
+(which clears it), or clear it directly:
+
+```bash
+sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db \
+    "UPDATE users SET locked_until = NULL WHERE email = 'someone@example.com';"
+```
+
+**Admin → audit log**, filtered to `login_failed` and `login_throttled`, shows
+what triggered it and from which addresses.
 
 ### `ModuleNotFoundError: No module named 'app'` on startup
 
