@@ -76,4 +76,12 @@ See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for TLS setup, backup strategy, t
 
 ## License
 
-MIT — see LICENSE if included.
+Copyright (C) 2026 James Chapman / OMG-Software
+
+Licensed under the GNU Affero General Public License v3.0 — see
+[`LICENSE`](LICENSE) for the full text.
+
+Atomiser is intended to be run as a network service, so the AGPL's section 13
+matters here: if you run a modified version and let other people use it over a
+network, you must offer those users the source of your modified version. Plain
+distribution of the source is covered by the usual GPL terms.

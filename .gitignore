@@ -34,5 +34,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Local agent settings, recreated by the tooling as permissions are granted
+# Local agent settings/metadata, recreated by the tooling as it is used
 .claude/settings.local.json
+.serena/

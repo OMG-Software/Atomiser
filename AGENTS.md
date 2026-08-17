@@ -59,6 +59,7 @@ Atomiser/
 │   ├── DEPLOYMENT.md        # Full production deployment guide
 │   └── PLAN.md              # Original implementation plan
 ├── README.md                # Quick start and feature overview
+├── LICENSE                  # GNU AGPL v3.0
 ├── AGENTS.md                # This guide (CLAUDE.md imports it)
 └── CLAUDE.md                # Agent entry point; imports AGENTS.md
 ```
