@@ -12,6 +12,7 @@ from app.auth import (
     verify_password,
     _audit,
 )
+from app import mail
 from app.db import get_db
 from app.roles import Role, has_role
 from app.utils import now_utc
@@ -59,6 +60,12 @@ async def _active_sessions(db, user_id: int) -> list:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def _notify_preference(db, user_id: int) -> bool:
+    cursor = await db.execute("SELECT notify_new_videos FROM users WHERE id = ?", (user_id,))
+    row = await cursor.fetchone()
+    return bool(row and row["notify_new_videos"])
+
+
 async def _profile_context(db, user, **extra) -> dict:
     """Context for rendering the current user's own profile page."""
     return {
@@ -67,6 +74,8 @@ async def _profile_context(db, user, **extra) -> dict:
         "videos": await _own_videos(db, user["id"]),
         "sessions": await _active_sessions(db, user["id"]),
         "current_session_id": user.get("session_id"),
+        "notify_new_videos": await _notify_preference(db, user["id"]),
+        "mail_enabled": mail.mail_enabled(),
         "site_title": await _site_title(db),
         **extra,
     }
@@ -141,9 +150,13 @@ async def update_profile(
         from fastapi import HTTPException, status
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
 
+    # An unchecked checkbox is simply absent from the body, so presence is the
+    # signal rather than the value.
+    notify = 1 if form.get("notify_new_videos") else 0
+
     await db.execute(
-        "UPDATE users SET display_name = ? WHERE id = ?",
-        (display_name.strip(), user["id"]),
+        "UPDATE users SET display_name = ?, notify_new_videos = ? WHERE id = ?",
+        (display_name.strip(), notify, user["id"]),
     )
     await db.commit()
     return RedirectResponse(url="/profile", status_code=303)

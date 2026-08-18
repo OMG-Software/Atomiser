@@ -305,6 +305,16 @@ async def edit_video(
             db, user["id"], "video_visibility_changed",
             target_type="video", target_id=video_uuid, request=request,
         )
+        # A video published after the fact still deserves its announcement.
+        # queue_new_video_notifications() is a no-op unless it is now ready,
+        # site-visible, and has never been announced.
+        if new_visibility == "site":
+            from app import notifications
+
+            try:
+                await notifications.queue_new_video_notifications(db, video["id"])
+            except Exception:  # noqa: BLE001 - the edit itself succeeded
+                logger.exception("Could not queue notifications for video %s", video_uuid)
     return RedirectResponse(url=f"/videos/{video_uuid}?success=1", status_code=303)
 
 

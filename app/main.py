@@ -7,7 +7,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app import auth, invites, jobs, users, admin, videos
+from app import auth, invites, jobs, notifications, users, admin, videos
 from app.config import Config, BASE_DIR
 from app.db import init_db
 from app.utils import generate_csrf
@@ -21,9 +21,14 @@ async def lifespan(app: FastAPI):
     # process left half-finished.
     if Config.RUN_TRANSCODE_WORKER:
         await jobs.start_workers()
+    # Drains the outbound email queue (new-video notifications).
+    if Config.RUN_EMAIL_WORKER:
+        await notifications.start_workers()
     try:
         yield
     finally:
+        if Config.RUN_EMAIL_WORKER:
+            await notifications.stop_workers()
         if Config.RUN_TRANSCODE_WORKER:
             await jobs.stop_workers()
 
@@ -192,6 +197,7 @@ invites.templates = app_templates
 users.templates = app_templates
 admin.templates = app_templates
 videos.templates = app_templates
+notifications.templates = app_templates
 
 # Static files (development convenience; nginx serves these in production).
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "app" / "static")), name="static")
@@ -201,6 +207,7 @@ app.include_router(auth.router)
 app.include_router(invites.router)
 app.include_router(users.router)
 app.include_router(admin.router)
+app.include_router(notifications.router)
 app.include_router(videos.router)
 
 

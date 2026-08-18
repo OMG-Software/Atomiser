@@ -81,6 +81,27 @@ class Config:
     # Password reset links are short-lived by design.
     PASSWORD_RESET_TTL_MINUTES: int = max(1, _env_int("PASSWORD_RESET_TTL_MINUTES", "60"))
 
+    # --- Email notifications ------------------------------------------------
+    # Master switch for "a new video was posted" emails. Members are subscribed
+    # by default and can opt out on their profile or from any notification's
+    # unsubscribe link; turning this off suppresses the whole feature.
+    NOTIFY_NEW_VIDEOS: bool = _env_bool("NOTIFY_NEW_VIDEOS", "true")
+    # Run the email queue worker inside the web app. Set false to run it as a
+    # separate process (see docs/DEPLOYMENT.md).
+    RUN_EMAIL_WORKER: bool = _env_bool("RUN_EMAIL_WORKER", "true")
+    # Messages sent per pass over one SMTP connection. A fan-out to a large
+    # membership is throttled by this, which keeps a burst of uploads from
+    # tripping the provider's rate limit.
+    EMAIL_BATCH_SIZE: int = max(1, _env_int("EMAIL_BATCH_SIZE", "20"))
+    # Seconds between passes when the queue is empty.
+    EMAIL_POLL_SECONDS: int = max(1, _env_int("EMAIL_POLL_SECONDS", "10"))
+    # Delivery attempts before a queued message is abandoned.
+    EMAIL_MAX_ATTEMPTS: int = max(1, _env_int("EMAIL_MAX_ATTEMPTS", "3"))
+    # Base delay before retrying a failed send. Doubles each attempt.
+    EMAIL_RETRY_MINUTES: int = max(1, _env_int("EMAIL_RETRY_MINUTES", "5"))
+    # Days a delivered/abandoned row is kept for the admin view before pruning.
+    EMAIL_RETENTION_DAYS: int = max(1, _env_int("EMAIL_RETENTION_DAYS", "30"))
+
     @classmethod
     def mail_enabled(cls) -> bool:
         """True when enough SMTP settings are present to attempt delivery."""

@@ -17,6 +17,24 @@
         <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
         <label for="display_name">Display name</label>
         <input type="text" id="display_name" name="display_name" value="{{ profile_user.display_name or '' }}" required maxlength="80">
+
+        {% if mail_enabled %}
+          <label style="margin-top:1.25rem;">Email notifications</label>
+          <label class="checkbox-row" for="notify_new_videos">
+            <input type="checkbox" id="notify_new_videos" name="notify_new_videos" value="1"
+                   {% if notify_new_videos %}checked{% endif %}>
+            <span>Email me when someone posts a new video</span>
+          </label>
+          <p class="field-hint">
+            Every notification also carries an unsubscribe link, so you can turn these off
+            straight from your inbox.
+          </p>
+        {% else %}
+          <p class="field-hint" style="margin-top:1.25rem;">
+            This site is not configured to send email, so there are no notification settings.
+          </p>
+        {% endif %}
+
         <div style="margin-top:1rem;">
           <button type="submit" class="btn">Save</button>
         </div>

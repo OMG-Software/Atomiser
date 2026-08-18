@@ -45,6 +45,69 @@
   </div>
 </div>
 
+{% if mail_status.site_url_missing %}
+  <div class="alert alert-error">
+    <strong>SITE_URL is not set.</strong>
+    New-video notifications are switched on and SMTP is configured, but links in those
+    emails are built from <code>SITE_URL</code>, so nothing can be sent until it is set
+    in the environment file.
+  </div>
+{% endif %}
+
+{% if mail_status.enabled %}
+  <div class="stat-grid">
+    <div class="card stat-tile">
+      <span class="stat-value">{{ stats.email_subscribers }}</span>
+      <span class="stat-label">Subscribed</span>
+      <span class="meta" style="font-size:0.8rem;">
+        {% if mail_status.notifications_on %}New-video emails on{% else %}Notifications disabled{% endif %}
+      </span>
+    </div>
+    <div class="card stat-tile">
+      <span class="stat-value">{{ stats.email_pending }}</span>
+      <span class="stat-label">Email queued</span>
+    </div>
+    <div class="card stat-tile">
+      <span class="stat-value">{{ stats.email_sent }}</span>
+      <span class="stat-label">Email sent</span>
+    </div>
+    <div class="card stat-tile">
+      <span class="stat-value" {% if stats.email_failed %}style="color: var(--danger);"{% endif %}>{{ stats.email_failed }}</span>
+      <span class="stat-label">Email failed</span>
+    </div>
+  </div>
+{% endif %}
+
+{% if failed_emails %}
+  <h2>Undeliverable email</h2>
+  <div class="table-wrap">
+    <table class="table-compact">
+      <thead>
+        <tr>
+          <th>To</th>
+          <th>Subject</th>
+          <th>Attempts</th>
+          <th>Last error</th>
+          <th>Queued</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for message in failed_emails %}
+          <tr>
+            <td>{{ message.to_address }}</td>
+            <td>{{ message.subject }}</td>
+            <td>{{ message.attempts }}</td>
+            <td style="max-width:340px; word-break:break-word;">
+              <span class="meta">{{ (message.last_error or '—')[:200] }}</span>
+            </td>
+            <td title="{{ message.created_at }}">{{ message.created_at|timeago }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
 {% if failed_jobs %}
   <h2>Failed transcodes</h2>
   <div class="table-wrap">

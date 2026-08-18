@@ -19,7 +19,8 @@ The default page title is **Atomiser Site** and is editable in the admin setting
 - **User profiles** — each profile lists videos posted by that user; owners can edit, re-scope, or delete their own videos.
 - **Admin dashboard** — storage use per user, videos by status, recent registrations, and one-click retry of failed transcodes.
 - **Audit log viewer** — filter the recorded activity trail by action, user, and date range.
-- **Optional email** — with SMTP configured, invites can be emailed and users can reset their own passwords. Without it the site behaves exactly as before: copy-paste invite links and admin-driven resets.
+- **Optional email** — with SMTP configured, invites can be emailed, users can reset their own passwords, and members are notified when someone posts a new video. Without it the site behaves exactly as before: copy-paste invite links and admin-driven resets.
+- **New-video notifications** — members are emailed when a video goes live, with a one-click unsubscribe link in every message. Delivery runs through a durable queue with retries, so a mail server hiccup does not lose notifications.
 
 ## Quick start (local)
 
@@ -82,12 +83,27 @@ in your `.env` to additionally enable:
 - **Self-service password reset** — `/auth/forgot` sends a single-use link that
   expires after `PASSWORD_RESET_TTL_MINUTES`. Completing a reset signs the
   account out of every device.
+- **New-video notifications** — when a video finishes transcoding and is visible
+  to the site, every subscribed member is emailed a link to it. Members are
+  subscribed by default and can opt out from their profile or from the
+  unsubscribe link carried by every notification (including the native
+  "unsubscribe" button in mail clients that support RFC 8058). Set
+  `NOTIFY_NEW_VIDEOS=false` to disable the feature for the whole site.
 
-Set `SITE_URL` as well, so links in emails are built from a value you control
-rather than from the request's `Host` header.
+Set `SITE_URL` as well. Password reset and invite links prefer it over the
+request's `Host` header, and notifications **require** it: the sending worker
+runs outside any request, so without it there is no hostname to build links
+from and no notification will be sent. The admin dashboard shows a warning if
+this is the case.
 
-With SMTP unset, `/auth/forgot` explains that an admin performs resets, and the
-invite form omits the email field.
+Notifications are delivered through a queue rather than sent inline, so a
+fan-out to a large membership never blocks a transcode, failures retry with a
+backoff, and a restart mid-send resumes. The admin dashboard reports how many
+messages are queued, sent and undeliverable.
+
+With SMTP unset, `/auth/forgot` explains that an admin performs resets, the
+invite form omits the email field, the profile page hides the notification
+setting, and nothing is ever queued.
 
 ## Security notes
 

@@ -487,6 +487,29 @@ label:first-child { margin-top: 0; }
 .inline-form { display: inline-flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
 .inline-form input, .inline-form select, .inline-form textarea { width: auto; margin-bottom: 0; }
 
+/* A checkbox and its wording on one line. The bare `label` rule above is
+   block-level with top margin, which stacks a checkbox above its own text. */
+.checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  margin: 0.5rem 0 0;
+  color: var(--text);
+  font-size: 0.94rem;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+.checkbox-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin: 0.15rem 0 0;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 /* ----------------------------------------------------------------------------
  * Alerts, badges, chips
  * ------------------------------------------------------------------------- */

@@ -37,11 +37,21 @@ _ADDED_COLUMNS = {
     "users": {
         # Set while an account is locked out after repeated failed logins.
         "locked_until": "TIMESTAMP",
+        # Email me when someone posts a new site-visible video. Opt-out: on by
+        # default, cleared from the profile page or an unsubscribe link.
+        "notify_new_videos": "INTEGER NOT NULL DEFAULT 1",
+        # Stable per-user secret in the unsubscribe link, so someone can turn
+        # notifications off from an email without signing in. Generated lazily
+        # by app/notifications.py; it grants nothing except unsubscribing.
+        "notify_token": "TEXT",
     },
     "videos": {
         # Size of the original upload, so the admin dashboard can report real
         # storage use even after the raw file has been purged.
         "raw_size_bytes": "INTEGER",
+        # Set when new-video notifications have been queued, so a retried
+        # transcode or a second visibility change cannot email everyone twice.
+        "notified_at": "TIMESTAMP",
     },
     "sessions": {
         # 'session' for a real login; 'webauthn' for the short-lived rows that

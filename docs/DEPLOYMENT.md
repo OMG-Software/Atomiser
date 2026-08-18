@@ -203,6 +203,43 @@ than the request's `Host` header. Send yourself a test invite from
 `/invites/` after enabling this; delivery failures are logged to the journal and
 never lose the invite, since the link is still shown on screen.
 
+### New-video notifications
+
+With SMTP configured, members are emailed whenever a video finishes processing
+and is visible to the site. They are subscribed by default and can opt out from
+their profile or from the unsubscribe link in any notification.
+
+```ini
+NOTIFY_NEW_VIDEOS=true
+EMAIL_BATCH_SIZE=20
+EMAIL_POLL_SECONDS=10
+EMAIL_MAX_ATTEMPTS=3
+EMAIL_RETRY_MINUTES=5
+EMAIL_RETENTION_DAYS=30
+```
+
+> **`SITE_URL` is required for this feature, not optional.** The sending worker
+> runs outside any HTTP request, so there is no `Host` header to fall back on.
+> With it unset, notifications are skipped rather than sent with broken links,
+> an error is logged, and the admin dashboard shows a warning.
+
+Messages go through the `email_queue` table rather than being sent inline, so a
+fan-out to a large membership never blocks a transcode, a failed send retries
+with an exponential backoff, and a restart mid-send resumes on the next start.
+`EMAIL_BATCH_SIZE` bounds how many messages go out per pass over one SMTP
+connection — lower it if your provider rate-limits you.
+
+The admin dashboard reports subscriber count and queued/sent/failed totals, and
+lists undeliverable messages with the SMTP error. To inspect the queue directly:
+
+```bash
+sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db     "SELECT id, to_address, status, attempts, last_error FROM email_queue ORDER BY id DESC LIMIT 20;"
+```
+
+Like transcoding, the email worker can run in its own process: set
+`RUN_EMAIL_WORKER=false` on the web service and `true` on a second unit. The
+conditional-UPDATE claim means two workers never send the same message twice.
+
 ---
 
 ## 4. Bootstrap the first Configurator
@@ -502,6 +539,22 @@ Jobs survive a restart, so this is almost always a real ffmpeg failure rather
 than a lost task. Check the failed-transcode list on the admin dashboard for the
 error, then retry it from there. A job left `running` by a hard kill is requeued
 automatically the next time the service starts.
+
+### Notification emails are not arriving
+
+- Check the admin dashboard first: it shows whether SMTP is detected, how many
+  messages are queued, and any undeliverable ones with the SMTP error.
+- A **`SITE_URL` is not set** banner there means notifications are being skipped
+  entirely. Set it in the environment file and restart.
+- Confirm the recipient is actually subscribed. An unsubscribe is per-user:
+  ```bash
+  sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db       "SELECT email, notify_new_videos FROM users;"
+  ```
+- Messages stuck at `queued` with rising `attempts` mean the SMTP server is
+  rejecting them; `last_error` carries the reason. Messages that never leave
+  `queued` with `attempts = 0` mean the worker is not running — check the
+  journal for `Started email queue worker` and `RUN_EMAIL_WORKER`.
+- Remember the uploader is deliberately never notified about their own video.
 
 ### A user is locked out
 

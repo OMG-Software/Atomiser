@@ -40,18 +40,34 @@ def absolute_url(request, path: str) -> str:
     return str(request.base_url).rstrip("/") + path
 
 
-def _build_message(to_address: str, subject: str, body: str, site_title: str) -> EmailMessage:
+def _build_message(
+    to_address: str,
+    subject: str,
+    body: str,
+    site_title: str,
+    unsubscribe_url: str = None,
+) -> EmailMessage:
     message = EmailMessage()
     from_name, from_email = parseaddr(Config.SMTP_FROM)
     message["From"] = formataddr((from_name or site_title, from_email or Config.SMTP_FROM))
     message["To"] = to_address
     message["Subject"] = subject
+
+    if unsubscribe_url:
+        # RFC 8058. Mail clients that understand these render a native
+        # "unsubscribe" control, and honouring it is what keeps bulk mail out of
+        # spam folders. List-Unsubscribe-Post tells the client it may POST
+        # rather than follow the link, which matters because our GET only shows
+        # a confirmation page.
+        message["List-Unsubscribe"] = f"<{unsubscribe_url}>"
+        message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+
     message.set_content(body)
     return message
 
 
-def _send_sync(message: EmailMessage) -> None:
-    """Blocking SMTP send. Runs on a threadpool via send_mail()."""
+def _connect_sync():
+    """Open an authenticated SMTP connection. Caller must close it."""
     context = ssl.create_default_context()
 
     if Config.SMTP_SSL:
@@ -61,17 +77,62 @@ def _send_sync(message: EmailMessage) -> None:
     else:
         client = smtplib.SMTP(Config.SMTP_HOST, Config.SMTP_PORT, timeout=Config.SMTP_TIMEOUT)
 
-    with client:
+    client.ehlo()
+    if Config.SMTP_STARTTLS and not Config.SMTP_SSL:
+        client.starttls(context=context)
         client.ehlo()
-        if Config.SMTP_STARTTLS and not Config.SMTP_SSL:
-            client.starttls(context=context)
-            client.ehlo()
-        if Config.SMTP_USERNAME:
-            client.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
+    if Config.SMTP_USERNAME:
+        client.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
+    return client
+
+
+def _send_sync(message: EmailMessage) -> None:
+    """Blocking SMTP send. Runs on a threadpool via send_mail()."""
+    with _connect_sync() as client:
         client.send_message(message)
 
 
-async def send_mail(to_address: str, subject: str, body: str, site_title: str = "Atomiser") -> bool:
+def _send_batch_sync(messages: list) -> list:
+    """Send several messages over one connection.
+
+    Returns a list of (index, error) for the ones that failed. A per-recipient
+    rejection does not abort the batch; a connection-level failure marks every
+    remaining message as failed so they are all retried together.
+    """
+    failures = []
+    try:
+        client = _connect_sync()
+    except Exception as exc:  # noqa: BLE001 - reported per message, not raised
+        return [(i, f"SMTP connection failed: {exc}") for i in range(len(messages))]
+
+    try:
+        with client:
+            for index, message in enumerate(messages):
+                try:
+                    client.send_message(message)
+                except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused,
+                        smtplib.SMTPDataError) as exc:
+                    # A bad address should not stop the rest of the batch.
+                    failures.append((index, str(exc)))
+                except Exception as exc:  # noqa: BLE001 - connection is suspect now
+                    failures.append((index, str(exc)))
+                    for remaining in range(index + 1, len(messages)):
+                        failures.append((remaining, "connection lost earlier in batch"))
+                    break
+    except Exception as exc:  # noqa: BLE001
+        sent = {i for i, _ in failures}
+        failures.extend((i, str(exc)) for i in range(len(messages)) if i not in sent)
+
+    return failures
+
+
+async def send_mail(
+    to_address: str,
+    subject: str,
+    body: str,
+    site_title: str = "Atomiser",
+    unsubscribe_url: str = None,
+) -> bool:
     """Send one message. Returns False (and logs) rather than raising."""
     if not mail_enabled():
         logger.debug("Mail not configured; skipping message to %s", to_address)
@@ -80,13 +141,38 @@ async def send_mail(to_address: str, subject: str, body: str, site_title: str = 
         return False
 
     try:
-        message = _build_message(to_address, subject, body, site_title)
+        message = _build_message(to_address, subject, body, site_title, unsubscribe_url)
         await run_in_threadpool(_send_sync, message)
         logger.info("Sent %r to %s", subject, to_address)
         return True
     except Exception:  # noqa: BLE001 - delivery failure must not break the request
         logger.exception("Failed to send %r to %s", subject, to_address)
         return False
+
+
+async def send_batch(items: list, site_title: str = "Atomiser") -> dict:
+    """Send a batch of messages over a single SMTP connection.
+
+    ``items`` are dicts with ``to_address``, ``subject``, ``body`` and an
+    optional ``unsubscribe_url``. Returns ``{index: error}`` for the failures,
+    so the caller can retry or abandon each message individually. Opening one
+    connection per recipient would be far slower and gets an account throttled
+    by most providers.
+    """
+    if not mail_enabled() or not items:
+        return {index: "mail is not configured" for index in range(len(items))}
+
+    messages = [
+        _build_message(
+            item["to_address"], item["subject"], item["body"], site_title,
+            item.get("unsubscribe_url"),
+        )
+        for item in items
+    ]
+    failures = await run_in_threadpool(_send_batch_sync, messages)
+    if failures:
+        logger.warning("%d of %d messages in batch failed", len(failures), len(messages))
+    return dict(failures)
 
 
 # ---------------------------------------------------------------------------

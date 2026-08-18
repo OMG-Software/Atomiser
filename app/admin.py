@@ -4,7 +4,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from app import jobs
+from app import jobs, mail
+from app.config import Config
 from app.auth import require_user, get_current_user, CSRF_COOKIE, verify_csrf, hash_password, _audit
 from app.db import get_db
 from app.models import UserEditForm, SiteSettingsForm
@@ -109,6 +110,45 @@ async def dashboard(request: Request, user=Depends(require_user), db=Depends(get
     )
     stats["queued_jobs"] = (await cursor.fetchone())["c"]
 
+    # Outbound email. Members are notified about new videos, so a silently
+    # broken mail server is worth surfacing here rather than only in the log.
+    cursor = await db.execute(
+        """
+        SELECT
+            SUM(CASE WHEN status IN ('queued', 'sending') THEN 1 ELSE 0 END) AS pending,
+            SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+        FROM email_queue
+        """
+    )
+    row = await cursor.fetchone()
+    stats["email_pending"] = row["pending"] or 0
+    stats["email_sent"] = row["sent"] or 0
+    stats["email_failed"] = row["failed"] or 0
+
+    cursor = await db.execute(
+        "SELECT COUNT(*) AS c FROM users WHERE notify_new_videos = 1"
+    )
+    stats["email_subscribers"] = (await cursor.fetchone())["c"]
+
+    cursor = await db.execute(
+        """
+        SELECT id, to_address, subject, attempts, last_error, created_at
+        FROM email_queue WHERE status = 'failed' ORDER BY id DESC LIMIT 10
+        """
+    )
+    failed_emails = [dict(r) for r in await cursor.fetchall()]
+
+    mail_status = {
+        "enabled": mail.mail_enabled(),
+        "notifications_on": Config.NOTIFY_NEW_VIDEOS,
+        # Notification links are built from SITE_URL because the worker has no
+        # request to derive a host from; without it nothing can be sent.
+        "site_url_missing": bool(
+            Config.NOTIFY_NEW_VIDEOS and mail.mail_enabled() and not Config.SITE_URL
+        ),
+    }
+
     return templates.TemplateResponse(
         "admin/dashboard.html",
         {
@@ -118,6 +158,8 @@ async def dashboard(request: Request, user=Depends(require_user), db=Depends(get
             "storage_by_user": storage_by_user,
             "recent_users": recent_users,
             "failed_jobs": failed_jobs,
+            "failed_emails": failed_emails,
+            "mail_status": mail_status,
             "site_title": await _site_title(db),
         },
     )

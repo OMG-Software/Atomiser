@@ -39,6 +39,7 @@ Atomiser/
 │   ├── videos.py            # Upload, transcode, feed, player, streaming, file cleanup
 │   ├── jobs.py              # Durable transcode queue and worker pool
 │   ├── mail.py              # Optional SMTP delivery (no-op when unconfigured)
+│   ├── notifications.py     # New-video email fan-out, queue worker, unsubscribe
 │   ├── ratelimit.py         # Sliding-window auth throttling and account lockout
 │   ├── admin.py             # Admin + Configurator dashboard, audit viewer
 │   ├── invites.py           # Invite generation, revocation
@@ -129,6 +130,15 @@ Use `require_role(user, Role.ADMIN)` or `Role.CONFIGURATOR` in routes. `require_
 - Use `mail.absolute_url(request, path)` for links that leave the app; it prefers `SITE_URL` over the request's `Host` header.
 - `ratelimit.py` counts failures against the **submitted** email string, not a resolved user id, so an unknown address is throttled exactly like a real one. Keep it that way — the difference would be an account-enumeration oracle.
 - Throttle checks belong *before* the Argon2 verification, which is deliberately expensive.
+
+### Email notifications
+
+- New-video emails fan out through the `email_queue` table drained by the worker in `notifications.py`, never sent inline. A hundred members would otherwise be a hundred blocking SMTP round trips inside the transcode worker.
+- `queue_new_video_notifications()` is idempotent: the conditional `UPDATE ... WHERE notified_at IS NULL` is the gate. Call it freely — a retried transcode or a second visibility flip cannot email everyone twice.
+- Notifications need `SITE_URL`. The worker has no request, so there is no `Host` header to fall back on; without it the function refuses rather than sending broken links, and the admin dashboard warns.
+- Members are subscribed by default (`notify_new_videos` defaults to 1). Every notification must carry an unsubscribe link, and `mail.send_batch()` sets the RFC 8058 `List-Unsubscribe` headers.
+- **The unsubscribe POST is the one state-changing route with no CSRF token.** It authenticates with the secret token from the emailed link so it works from a mail client, and there is no ambient authority to abuse. Do not "fix" it by adding a CSRF check — that breaks one-click unsubscribe.
+- The unsubscribe **GET must never change anything.** Mail scanners and link prefetchers follow URLs in email, so a mutating GET silently unsubscribes people who never clicked. The GET renders a confirmation; the POST acts.
 
 ## Environment and running locally
 

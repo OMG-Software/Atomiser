@@ -189,8 +189,19 @@ async def _run_job(db, job) -> None:
 
     if final_status == "ready":
         await _finish_job(db, job["id"], "done")
+        await _notify_subscribers(db, job["video_id"])
     else:
         await _handle_failure(db, job, "transcode produced no usable renditions")
+
+
+async def _notify_subscribers(db, video_id: int) -> None:
+    """Queue new-video emails. Never let this break a completed transcode."""
+    from app import notifications
+
+    try:
+        await notifications.queue_new_video_notifications(db, video_id)
+    except Exception:  # noqa: BLE001 - the video is ready either way
+        logger.exception("Could not queue notifications for video %s", video_id)
 
 
 async def _handle_failure(db, job, error: str) -> None:
