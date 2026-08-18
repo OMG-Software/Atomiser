@@ -648,6 +648,8 @@ def mail_configured(monkeypatch):
 
     monkeypatch.setattr(Config, "SMTP_HOST", "smtp.example.com")
     monkeypatch.setattr(Config, "SMTP_FROM", "atomiser@example.com")
+    # Required: emailed links are built from SITE_URL, never from the request.
+    monkeypatch.setattr(Config, "SITE_URL", "https://videos.example.com")
 
     sent = []
 
@@ -843,3 +845,104 @@ async def test_reset_requires_csrf(client, member_user, mail_configured, csrf):
         follow_redirects=False,
     )
     assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Host-header injection on emailed links
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reset_link_ignores_a_spoofed_host_header(client, csrf, member_user, mail_configured):
+    """The emailed link must come from SITE_URL, never the request's Host.
+
+    nginx passes the client Host through verbatim, so deriving the link from it
+    would let an attacker request a reset for someone else and have the genuine
+    token emailed to the victim under a domain the attacker controls.
+    """
+    resp = await client.post(
+        "/auth/forgot",
+        data={"email": member_user["email"], "csrf": csrf},
+        headers={"Host": "evil.test"},
+    )
+    assert resp.status_code == 200
+
+    body = mail_configured[0]["body"]
+    assert "https://videos.example.com/auth/reset?token=" in body
+    assert "evil.test" not in body
+
+
+@pytest.mark.asyncio
+async def test_reset_is_refused_when_site_url_is_unset(client, csrf, member_user, monkeypatch, db):
+    """Rather than fall back to the Host header, recovery turns itself off."""
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "SMTP_HOST", "smtp.example.com")
+    monkeypatch.setattr(Config, "SMTP_FROM", "atomiser@example.com")
+    monkeypatch.setattr(Config, "SITE_URL", "")
+
+    resp = await client.post(
+        "/auth/forgot",
+        data={"email": member_user["email"], "csrf": csrf},
+        headers={"Host": "evil.test"},
+    )
+    assert resp.status_code == 400
+    assert "not available" in resp.text
+
+    # No token was minted, so nothing can leak.
+    cursor = await db.execute("SELECT COUNT(*) AS c FROM password_resets")
+    assert (await cursor.fetchone())["c"] == 0
+
+
+def test_email_link_refuses_without_site_url(monkeypatch):
+    from app import mail as mail_module
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "SITE_URL", "")
+    assert mail_module.email_links_available() is False
+    with pytest.raises(RuntimeError):
+        mail_module.email_link("/auth/reset?token=abc")
+
+
+# ---------------------------------------------------------------------------
+# Throttling must not distinguish real from unknown addresses
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mixed_case_address_is_throttled_like_a_real_one(
+    client, csrf, member_user, low_login_threshold
+):
+    """Regression: failures were recorded normalized but counted raw, so the
+    same mixed-case input answered 429 for a real account and 401 for an
+    unknown one - an enumeration oracle."""
+    real = "  Member@Example.COM "
+    ghost = "  Ghost@Example.COM "
+
+    for address in (real, ghost):
+        for _ in range(low_login_threshold.LOGIN_MAX_FAILURES_PER_EMAIL):
+            resp = await _bad_login(client, csrf, email=address)
+            assert resp.status_code == 401
+
+    real_resp = await _bad_login(client, csrf, email=real)
+    ghost_resp = await _bad_login(client, csrf, email=ghost)
+
+    assert real_resp.status_code == ghost_resp.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_success_clears_failures_recorded_under_mixed_case(
+    client, csrf, member_user, low_login_threshold
+):
+    for _ in range(low_login_threshold.LOGIN_MAX_FAILURES_PER_EMAIL - 1):
+        await _bad_login(client, csrf, email="MEMBER@example.com")
+
+    resp = await client.post(
+        "/auth/login",
+        data={
+            "email": member_user["email"],
+            "password": member_user["password"],
+            "csrf": csrf,
+            "next": "/",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303

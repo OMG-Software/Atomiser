@@ -12,7 +12,12 @@ again on the next start.
 """
 
 import asyncio
+import contextlib
 import logging
+import os
+import socket
+import uuid
+from datetime import timedelta
 
 import aiosqlite
 
@@ -20,6 +25,11 @@ from app.config import Config
 from app.utils import now_utc
 
 logger = logging.getLogger(__name__)
+
+# Identifies this process in transcode_jobs.worker_id. Purely diagnostic - the
+# lease is what actually guards ownership - but it makes "who is running this?"
+# answerable from the database during a rolling restart.
+WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 # How long a worker sleeps when it finds no queued job. Uploads are infrequent
 # on a community site, so polling this slowly costs nothing and keeps the
@@ -41,6 +51,15 @@ async def _connect() -> aiosqlite.Connection:
     await db.execute("PRAGMA journal_mode = WAL")
     await db.execute("PRAGMA busy_timeout = 30000")
     return db
+
+
+def _lease_deadline() -> str:
+    return (now_utc() + timedelta(seconds=Config.TRANSCODE_LEASE_SECONDS)).isoformat()
+
+
+# Renew well inside the lease so a couple of missed beats are survivable.
+def _heartbeat_interval() -> float:
+    return max(5.0, Config.TRANSCODE_LEASE_SECONDS / 3)
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +102,20 @@ async def requeue_orphans(db) -> int:
     """
     recovered = 0
 
+    # Only reclaim a job whose lease has lapsed. Resetting every 'running' row
+    # would be wrong whenever two processes overlap - a rolling restart, or a
+    # separate worker unit alongside the web app: the starting process would
+    # requeue a job another process is still transcoding, and both would then
+    # write the same rendition paths and insert duplicate rendition rows,
+    # defeating the concurrency gate. A live worker renews its lease every few
+    # seconds, so anything expired really is orphaned.
     cursor = await db.execute(
-        "UPDATE transcode_jobs SET status = 'queued', started_at = NULL WHERE status = 'running'"
+        """
+        UPDATE transcode_jobs
+        SET status = 'queued', started_at = NULL, worker_id = NULL, lease_expires_at = NULL
+        WHERE status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at < ?)
+        """,
+        (now_utc().isoformat(),),
     )
     recovered += cursor.rowcount or 0
 
@@ -134,10 +165,11 @@ async def _claim_job(db):
         cursor = await db.execute(
             """
             UPDATE transcode_jobs
-            SET status = 'running', started_at = ?, attempts = attempts + 1
+            SET status = 'running', started_at = ?, attempts = attempts + 1,
+                worker_id = ?, lease_expires_at = ?
             WHERE id = ? AND status = 'queued'
             """,
-            (now_utc().isoformat(), row["id"]),
+            (now_utc().isoformat(), WORKER_ID, _lease_deadline(), row["id"]),
         )
         await db.commit()
         if cursor.rowcount == 1:
@@ -147,10 +179,38 @@ async def _claim_job(db):
 
 async def _finish_job(db, job_id: int, status: str, error: str = None):
     await db.execute(
-        "UPDATE transcode_jobs SET status = ?, finished_at = ?, last_error = ? WHERE id = ?",
+        """
+        UPDATE transcode_jobs
+        SET status = ?, finished_at = ?, last_error = ?, lease_expires_at = NULL
+        WHERE id = ?
+        """,
         (status, now_utc().isoformat(), error, job_id),
     )
     await db.commit()
+
+
+async def _heartbeat(job_id: int) -> None:
+    """Renew a job's lease while it transcodes.
+
+    Uses its own connection: the worker's connection is busy awaiting ffmpeg,
+    and interleaving statements on one aiosqlite connection from two tasks is
+    asking for trouble.
+    """
+    db = await _connect()
+    try:
+        while True:
+            await asyncio.sleep(_heartbeat_interval())
+            await db.execute(
+                "UPDATE transcode_jobs SET lease_expires_at = ? WHERE id = ? AND status = 'running'",
+                (_lease_deadline(), job_id),
+            )
+            await db.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a failed renewal must not kill the job
+        logger.exception("Heartbeat failed for job %s", job_id)
+    finally:
+        await db.close()
 
 
 async def _run_job(db, job) -> None:
@@ -176,12 +236,17 @@ async def _run_job(db, job) -> None:
         await db.commit()
         return
 
+    heartbeat = asyncio.create_task(_heartbeat(job["id"]), name=f"lease-{job['id']}")
     try:
         await transcode_video(video["id"], video["raw_path"], video["uuid"])
     except Exception as exc:  # noqa: BLE001 - a job must never kill the worker
         logger.exception("Transcode job %s raised", job["id"])
         await _handle_failure(db, job, str(exc))
         return
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
 
     cursor = await db.execute("SELECT status FROM videos WHERE id = ?", (job["video_id"],))
     row = await cursor.fetchone()
@@ -208,7 +273,12 @@ async def _handle_failure(db, job, error: str) -> None:
     """Requeue while attempts remain, otherwise mark the video failed."""
     if job["attempts"] < Config.TRANSCODE_MAX_ATTEMPTS:
         await db.execute(
-            "UPDATE transcode_jobs SET status = 'queued', started_at = NULL, last_error = ? WHERE id = ?",
+            """
+            UPDATE transcode_jobs
+            SET status = 'queued', started_at = NULL, last_error = ?,
+                worker_id = NULL, lease_expires_at = NULL
+            WHERE id = ?
+            """,
             (error, job["id"]),
         )
         await db.execute(

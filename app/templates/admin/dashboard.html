@@ -48,9 +48,11 @@
 {% if mail_status.site_url_missing %}
   <div class="alert alert-error">
     <strong>SITE_URL is not set.</strong>
-    New-video notifications are switched on and SMTP is configured, but links in those
-    emails are built from <code>SITE_URL</code>, so nothing can be sent until it is set
-    in the environment file.
+    SMTP is configured, but every link that goes into an email is built from
+    <code>SITE_URL</code> — the only other source of a hostname is the request&#39;s
+    <code>Host</code> header, which the client controls. Until it is set in the
+    environment file, password recovery is refused, invites cannot be emailed, and
+    no new-video notifications are sent.
   </div>
 {% endif %}
 

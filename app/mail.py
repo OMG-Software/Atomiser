@@ -28,11 +28,41 @@ def mail_enabled() -> bool:
     return Config.mail_enabled()
 
 
-def absolute_url(request, path: str) -> str:
-    """Build an absolute URL for a link that will leave the site.
+def email_links_available() -> bool:
+    """True when a link can be built from configuration alone.
 
-    Prefers SITE_URL, because the Host header a request arrived with is
-    attacker-controllable and these links go into emails.
+    Anything that goes into an email needs this. It is separate from
+    mail_enabled() because a working SMTP server is not sufficient: without
+    SITE_URL there is no trustworthy hostname to put in the message.
+    """
+    return bool(Config.SITE_URL)
+
+
+def email_link(path: str) -> str:
+    """Absolute URL for a link that will be emailed. Requires SITE_URL.
+
+    Deliberately does NOT fall back to the request's host. Starlette derives
+    request.base_url from the Host header, which the client controls and nginx
+    passes through verbatim (the shipped config sets `proxy_set_header Host
+    $host`, and a single 443 server block is the default for any Host). Building
+    a password reset link that way is a host-header injection: an attacker POSTs
+    to /auth/forgot with the victim's address and `Host: evil.test`, and the app
+    emails the victim a genuine reset token pointing at the attacker's domain.
+    Following it hands over the token, and with it the account.
+
+    Callers must check email_links_available() and degrade rather than send.
+    """
+    if not Config.SITE_URL:
+        raise RuntimeError("SITE_URL is required to build links for outbound email")
+    return f"{Config.SITE_URL}/{path.lstrip('/')}"
+
+
+def display_url(request, path: str) -> str:
+    """Absolute URL for showing on screen to the user who made the request.
+
+    Falls back to the request host, which is safe here only because the value is
+    rendered back to the person who supplied it. Never use this for email -
+    use email_link().
     """
     path = "/" + path.lstrip("/")
     if Config.SITE_URL:

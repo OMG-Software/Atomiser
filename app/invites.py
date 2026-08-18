@@ -107,16 +107,25 @@ async def invite_create(
     await _audit(db, user["id"], "invite_created", target_type="invite", target_id=str(invite_id), request=request)
 
     # The raw token is never stored, so this is the only time it can be shown.
-    invite_url = mail.absolute_url(request, f"/auth/register?token={token}")
+    # display_url may fall back to the request host, which is safe because the
+    # result is rendered straight back to the admin who asked for it.
+    invite_url = mail.display_url(request, f"/auth/register?token={token}")
 
     email_status = None
     if send_to:
         if not mail.mail_enabled():
             email_status = ("error", "Email is not configured on this server, so the link was not sent.")
+        elif not mail.email_links_available():
+            # Never put a Host-header-derived URL in an email.
+            email_status = (
+                "error",
+                "SITE_URL is not set on this server, so an invite link cannot be emailed safely. "
+                "Copy the link below instead.",
+            )
         else:
             sent = await mail.send_invite(
                 send_to,
-                invite_url,
+                mail.email_link(f"/auth/register?token={token}"),
                 await _site_title(db),
                 user.get("display_name") or user["email"],
                 expires_hours,

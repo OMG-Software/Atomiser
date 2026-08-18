@@ -121,14 +121,16 @@ Use `require_role(user, Role.ADMIN)` or `Role.CONFIGURATOR` in routes. `require_
 - Transcoding is **not** a `BackgroundTasks` job. Uploads insert a row into `transcode_jobs` and a worker pool started in `main.py`'s lifespan picks it up.
 - `jobs.requeue_orphans()` runs at startup: it resets jobs left `running` by a crash and queues any video stuck in a pending status with no job row.
 - A job is claimed with a conditional `UPDATE ... WHERE status = 'queued'`; the `rowcount == 1` check is the concurrency gate. Do not replace it with a plain SELECT-then-UPDATE.
+- Claiming also takes a **lease** (`worker_id`, `lease_expires_at`), renewed by a heartbeat task while ffmpeg runs. `requeue_orphans()` reclaims only rows whose lease has expired. Never reset every `running`/`sending` row unconditionally: during a rolling restart, or with a separate worker unit alongside the web app, the starting process would requeue work another process is still doing — two ffmpeg runs writing the same rendition paths, or a notification batch delivered twice. `email_queue` uses the same scheme.
 - Failures retry up to `TRANSCODE_MAX_ATTEMPTS`, then mark the video `failed`.
 - Video status flows `uploading` → `processing` → `ready`/`failed`. The player polls `/videos/<uuid>/status` while it is not ready.
 
 ### Email and rate limiting
 
 - `mail.py` is optional by design. `Config.mail_enabled()` is false unless both `SMTP_HOST` and `SMTP_FROM` are set, and every feature that uses mail must still work without it. `send_mail()` returns False on failure rather than raising.
-- Use `mail.absolute_url(request, path)` for links that leave the app; it prefers `SITE_URL` over the request's `Host` header.
+- **Anything going into an email must use `mail.email_link(path)`**, which is built from `SITE_URL` alone and raises if it is unset. Callers check `mail.email_links_available()` and degrade rather than send. `mail.display_url(request, path)` may fall back to the request host, but only because its result is rendered straight back to the person who made the request — never put it in a message. Starlette derives `request.base_url` from the `Host` header, the client controls it, and the shipped nginx config forwards it verbatim; a reset link built that way is a host-header injection that hands an attacker a live token.
 - `ratelimit.py` counts failures against the **submitted** email string, not a resolved user id, so an unknown address is throttled exactly like a real one. Keep it that way — the difference would be an account-enumeration oracle.
+- Every read and write of an email key in `ratelimit.py` goes through `_normalize()`. Recording under the normalized address while counting under the raw one silently reopens that oracle: the real account still locks (via `apply_lockout`, which normalizes), the unknown one never reaches the threshold, and the same mixed-case input answers 429 for one and 401 for the other.
 - Throttle checks belong *before* the Argon2 verification, which is deliberately expensive.
 
 ### Email notifications

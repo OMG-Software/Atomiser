@@ -33,12 +33,25 @@ def _window_start() -> str:
     return (now_utc() - timedelta(seconds=Config.RATE_LIMIT_WINDOW_SECONDS)).isoformat()
 
 
+def _normalize(email: str) -> str:
+    """Canonical form of a submitted address.
+
+    Every read and write of an email key must go through this. Counting
+    failures under the raw submitted string while recording them under the
+    normalized one silently defeats the limiter: a real account still locks
+    (because apply_lockout normalizes), while an unknown address never reaches
+    the threshold, so the same mixed-case input answers 429 for one and 401 for
+    the other - exactly the enumeration oracle this module exists to avoid.
+    """
+    return (email or "").lower().strip()
+
+
 async def record_failure(db, scope: str, email: str = None, ip: str = None) -> None:
     """Note a failed attempt against both keys."""
     if not Config.RATE_LIMIT_ENABLED:
         return
     stamp = now_utc().isoformat()
-    for kind, value in (("email", (email or "").lower().strip()), ("ip", ip or "")):
+    for kind, value in (("email", _normalize(email)), ("ip", ip or "")):
         if not value:
             continue
         await db.execute(
@@ -57,12 +70,13 @@ async def clear_failures(db, scope: str, email: str = None) -> None:
         return
     await db.execute(
         "DELETE FROM login_attempts WHERE scope = ? AND key_kind = 'email' AND key_value = ?",
-        (scope, email.lower().strip()),
+        (scope, _normalize(email)),
     )
     await db.commit()
 
 
 async def _failure_count(db, scope: str, kind: str, value: str) -> int:
+    """Count recent failures for one key. `value` must already be normalized."""
     cursor = await db.execute(
         """
         SELECT COUNT(*) AS c FROM login_attempts
@@ -86,8 +100,9 @@ async def retry_after_minutes(db, scope: str, email: str = None, ip: str = None)
     now = now_utc()
 
     if email:
+        email = _normalize(email)
         cursor = await db.execute(
-            "SELECT locked_until FROM users WHERE email = ?", (email.lower().strip(),)
+            "SELECT locked_until FROM users WHERE email = ?", (email,)
         )
         row = await cursor.fetchone()
         if row and row["locked_until"]:
@@ -115,14 +130,18 @@ async def apply_lockout(db, email: str) -> None:
     """
     if not Config.RATE_LIMIT_ENABLED or not email:
         return
-    email = email.lower().strip()
+    email = _normalize(email)
     if await _failure_count(db, SCOPE_LOGIN, "email", email) < Config.LOGIN_MAX_FAILURES_PER_EMAIL:
         return
 
     until = (now_utc() + timedelta(minutes=Config.LOCKOUT_MINUTES)).isoformat()
-    await db.execute("UPDATE users SET locked_until = ? WHERE email = ?", (until, email))
+    cursor = await db.execute("UPDATE users SET locked_until = ? WHERE email = ?", (until, email))
     await db.commit()
-    logger.warning("Locked account %s until %s after repeated failed logins", email, until)
+    # An unknown address matches no row. It is still throttled by the sliding
+    # window above, so both cases look identical to the client - only the log
+    # would be misleading if it claimed to have locked a nonexistent account.
+    if cursor.rowcount:
+        logger.warning("Locked account %s until %s after repeated failed logins", email, until)
 
 
 async def unlock(db, email: str) -> None:
@@ -130,7 +149,7 @@ async def unlock(db, email: str) -> None:
     if not email:
         return
     await db.execute(
-        "UPDATE users SET locked_until = NULL WHERE email = ?", (email.lower().strip(),)
+        "UPDATE users SET locked_until = NULL WHERE email = ?", (_normalize(email),)
     )
     await db.commit()
 

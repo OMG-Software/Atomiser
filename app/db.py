@@ -59,6 +59,20 @@ _ADDED_COLUMNS = {
         # only real logins.
         "purpose": "TEXT NOT NULL DEFAULT 'session'",
     },
+    "transcode_jobs": {
+        # Which process holds the job, and until when. requeue_orphans() only
+        # reclaims a 'running' row once its lease has expired, so two overlapping
+        # processes cannot both transcode the same video.
+        "worker_id": "TEXT",
+        "lease_expires_at": "TIMESTAMP",
+    },
+    "email_queue": {
+        # Same lease scheme as transcode_jobs. Without it, a second process
+        # starting up would requeue messages another worker is mid-send on and
+        # deliver them twice.
+        "worker_id": "TEXT",
+        "lease_expires_at": "TIMESTAMP",
+    },
     "invites": {
         # Free-text label so an admin can remember who an invite was for.
         "note": "TEXT",

@@ -142,11 +142,10 @@ async def dashboard(request: Request, user=Depends(require_user), db=Depends(get
     mail_status = {
         "enabled": mail.mail_enabled(),
         "notifications_on": Config.NOTIFY_NEW_VIDEOS,
-        # Notification links are built from SITE_URL because the worker has no
-        # request to derive a host from; without it nothing can be sent.
-        "site_url_missing": bool(
-            Config.NOTIFY_NEW_VIDEOS and mail.mail_enabled() and not Config.SITE_URL
-        ),
+        # Every emailed link is built from SITE_URL. Without it, notifications
+        # cannot be sent at all and password recovery is refused, because the
+        # only other source of a hostname is the client-controlled Host header.
+        "site_url_missing": bool(mail.mail_enabled() and not Config.SITE_URL),
     }
 
     return templates.TemplateResponse(

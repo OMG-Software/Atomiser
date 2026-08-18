@@ -70,19 +70,76 @@ async def test_a_job_is_only_claimed_once(db, member_user):
     assert second is None
 
 
+async def _expire_lease(db, job_id):
+    """Simulate the owning process dying: its lease lapses."""
+    from datetime import timedelta
+
+    from app.utils import now_utc
+
+    await db.execute(
+        "UPDATE transcode_jobs SET lease_expires_at = ? WHERE id = ?",
+        ((now_utc() - timedelta(seconds=1)).isoformat(), job_id),
+    )
+    await db.commit()
+
+
 @pytest.mark.asyncio
-async def test_requeue_orphans_recovers_running_jobs(db, member_user):
+async def test_requeue_orphans_recovers_jobs_with_an_expired_lease(db, member_user):
     """A job left 'running' by a crash must be picked back up, not stranded."""
     owner_id = await _user_id(db)
     video_id, _ = await _create_video(db, owner_id, status="processing")
     await jobs.enqueue(db, video_id)
     claimed = await jobs._claim_job(db)
+    await _expire_lease(db, claimed["id"])
 
     recovered = await jobs.requeue_orphans(db)
     assert recovered >= 1
 
     cursor = await db.execute("SELECT status FROM transcode_jobs WHERE id = ?", (claimed["id"],))
     assert (await cursor.fetchone())["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_requeue_orphans_leaves_live_jobs_alone(db, member_user):
+    """The bug this guards: a second process starting up during a rolling
+    restart used to requeue a job another process was still transcoding, so two
+    ffmpeg runs wrote the same rendition paths."""
+    owner_id = await _user_id(db)
+    video_id, _ = await _create_video(db, owner_id, status="processing")
+    await jobs.enqueue(db, video_id)
+    claimed = await jobs._claim_job(db)
+
+    # Lease is still live, so a starting process must not touch it.
+    await jobs.requeue_orphans(db)
+
+    cursor = await db.execute(
+        "SELECT status, worker_id FROM transcode_jobs WHERE id = ?", (claimed["id"],)
+    )
+    row = await cursor.fetchone()
+    assert row["status"] == "running"
+    assert row["worker_id"] == jobs.WORKER_ID
+
+    # And it cannot be claimed out from under the running worker either.
+    assert await jobs._claim_job(db) is None
+
+
+@pytest.mark.asyncio
+async def test_claim_records_worker_and_lease(db, member_user):
+    owner_id = await _user_id(db)
+    video_id, _ = await _create_video(db, owner_id)
+    await jobs.enqueue(db, video_id)
+
+    job = await jobs._claim_job(db)
+
+    cursor = await db.execute(
+        "SELECT worker_id, lease_expires_at FROM transcode_jobs WHERE id = ?", (job["id"],)
+    )
+    row = await cursor.fetchone()
+    assert row["worker_id"] == jobs.WORKER_ID
+
+    from app.utils import now_utc
+
+    assert row["lease_expires_at"] > now_utc().isoformat()
 
 
 @pytest.mark.asyncio

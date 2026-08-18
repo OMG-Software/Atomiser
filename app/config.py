@@ -55,6 +55,11 @@ class Config:
     # Set false to run the worker as a separate process (see docs/DEPLOYMENT.md)
     # instead of inside the web app.
     RUN_TRANSCODE_WORKER: bool = _env_bool("RUN_TRANSCODE_WORKER", "true")
+    # How long a claimed job stays owned by its worker. The worker renews this
+    # every LEASE/3 seconds while ffmpeg runs, so only a job whose process has
+    # actually died is reclaimed on startup. Raise it if a worker is ever paused
+    # long enough (heavy swap, suspended VM) to miss several heartbeats.
+    TRANSCODE_LEASE_SECONDS: int = max(30, _env_int("TRANSCODE_LEASE_SECONDS", "120"))
 
     # --- Rate limiting ------------------------------------------------------
     # Portable, in-app throttling so protection does not depend on the nginx
@@ -101,6 +106,10 @@ class Config:
     EMAIL_RETRY_MINUTES: int = max(1, _env_int("EMAIL_RETRY_MINUTES", "5"))
     # Days a delivered/abandoned row is kept for the admin view before pruning.
     EMAIL_RETENTION_DAYS: int = max(1, _env_int("EMAIL_RETENTION_DAYS", "30"))
+    # How long a claimed batch stays owned by its worker. Sending is quick, so
+    # this only has to outlast one batch; it exists so an overlapping process
+    # cannot reclaim and re-send messages that are still in flight.
+    EMAIL_LEASE_SECONDS: int = max(30, _env_int("EMAIL_LEASE_SECONDS", "300"))
 
     @classmethod
     def mail_enabled(cls) -> bool:

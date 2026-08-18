@@ -1,6 +1,7 @@
 import base64
 import binascii
 import json
+import logging
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -26,6 +27,8 @@ from app.db import get_db
 from app.models import LoginForm, RegisterForm, TOTPChallengeForm
 from app.roles import Role, require_role
 from app.utils import generate_token, hash_token, new_video_uuid, now_utc, verify_csrf
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -476,7 +479,16 @@ async def forgot_post(
     site_title = await _site_title(db)
     context = {"request": request, "mail_enabled": mail.mail_enabled(), "site_title": site_title}
 
-    if not mail.mail_enabled():
+    # Recovery needs both a mail server and a configured SITE_URL. Without the
+    # latter the only available hostname is the client-supplied Host header,
+    # and emailing a live reset token to whatever domain the requester names is
+    # an account-takeover primitive - so refuse instead.
+    if not mail.mail_enabled() or not mail.email_links_available():
+        if mail.mail_enabled():
+            logger.error(
+                "SITE_URL is not set, so password reset links cannot be built safely. "
+                "Refusing the reset request."
+            )
         return templates.TemplateResponse(
             "auth/forgot.html",
             {**context, "error": "Password recovery by email is not available on this site. Please ask an admin to reset your password."},
@@ -517,7 +529,7 @@ async def forgot_post(
 
         await mail.send_password_reset(
             user["email"],
-            mail.absolute_url(request, f"/auth/reset?token={token}"),
+            mail.email_link(f"/auth/reset?token={token}"),
             site_title,
             Config.PASSWORD_RESET_TTL_MINUTES,
         )

@@ -12,6 +12,9 @@ The whole feature is inert unless SMTP is configured. See app/mail.py.
 
 import asyncio
 import logging
+import os
+import socket
+import uuid
 from datetime import timedelta
 
 import aiosqlite
@@ -29,8 +32,15 @@ router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 templates = None  # initialised in main.py
 
+# Identifies this process in email_queue.worker_id, as in app/jobs.py.
+WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
 _workers: list = []
 _stop = asyncio.Event()
+
+
+def _lease_deadline() -> str:
+    return (now_utc() + timedelta(seconds=Config.EMAIL_LEASE_SECONDS)).isoformat()
 
 
 async def _connect() -> aiosqlite.Connection:
@@ -240,9 +250,10 @@ async def _claim_batch(db) -> list:
 
     placeholders = ",".join("?" * len(ids))
     cursor = await db.execute(
-        f"UPDATE email_queue SET status = 'sending', attempts = attempts + 1 "
+        f"UPDATE email_queue SET status = 'sending', attempts = attempts + 1, "
+        f"worker_id = ?, lease_expires_at = ? "
         f"WHERE id IN ({placeholders}) AND status = 'queued'",
-        ids,
+        [WORKER_ID, _lease_deadline()] + ids,
     )
     await db.commit()
     if not cursor.rowcount:
@@ -259,14 +270,18 @@ async def _claim_batch(db) -> list:
 async def _finish(db, message_id: int, error: str, attempts: int) -> None:
     if not error:
         await db.execute(
-            "UPDATE email_queue SET status = 'sent', sent_at = ?, last_error = NULL WHERE id = ?",
+            """
+            UPDATE email_queue
+            SET status = 'sent', sent_at = ?, last_error = NULL, lease_expires_at = NULL
+            WHERE id = ?
+            """,
             (now_utc().isoformat(), message_id),
         )
         return
 
     if attempts >= Config.EMAIL_MAX_ATTEMPTS:
         await db.execute(
-            "UPDATE email_queue SET status = 'failed', last_error = ? WHERE id = ?",
+            "UPDATE email_queue SET status = 'failed', last_error = ?, lease_expires_at = NULL WHERE id = ?",
             (error, message_id),
         )
         logger.error("Giving up on queued email %s after %s attempts: %s", message_id, attempts, error)
@@ -277,7 +292,12 @@ async def _finish(db, message_id: int, error: str, attempts: int) -> None:
     delay = Config.EMAIL_RETRY_MINUTES * (2 ** (attempts - 1))
     retry_at = (now_utc() + timedelta(minutes=delay)).isoformat()
     await db.execute(
-        "UPDATE email_queue SET status = 'queued', scheduled_for = ?, last_error = ? WHERE id = ?",
+        """
+        UPDATE email_queue
+        SET status = 'queued', scheduled_for = ?, last_error = ?,
+            worker_id = NULL, lease_expires_at = NULL
+        WHERE id = ?
+        """,
         (retry_at, error, message_id),
     )
     logger.warning(
@@ -308,9 +328,19 @@ async def _send_batch(db, batch: list) -> None:
 
 
 async def requeue_orphans(db) -> int:
-    """Return messages left 'sending' by a crash to the queue."""
+    """Return messages left 'sending' by a crash to the queue.
+
+    Lease-guarded for the same reason as transcode jobs: a second process
+    starting up must not reclaim a batch another worker is mid-send on, or the
+    recipients get the notification twice.
+    """
     cursor = await db.execute(
-        "UPDATE email_queue SET status = 'queued' WHERE status = 'sending'"
+        """
+        UPDATE email_queue
+        SET status = 'queued', worker_id = NULL, lease_expires_at = NULL
+        WHERE status = 'sending' AND (lease_expires_at IS NULL OR lease_expires_at < ?)
+        """,
+        (now_utc().isoformat(),),
     )
     await db.commit()
     recovered = cursor.rowcount or 0

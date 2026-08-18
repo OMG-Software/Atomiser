@@ -118,7 +118,7 @@ MAX_UPLOAD_MB=500
 # Must match your public domain, or passkeys will not work.
 WEBAUTHN_RP_ID=example.com
 
-# Used to build links that leave the app (password reset and invite emails).
+# Required as soon as SMTP is enabled: every emailed link is built from this.
 SITE_URL=https://example.com
 
 # Not used in production because nginx talks to the unix socket, but keep sensible defaults.
@@ -152,6 +152,15 @@ On a busy site you can move transcoding off the web service entirely: set
 unit with it set to `true` that imports `app.jobs` and calls `start_workers()`.
 Both processes share the same SQLite database, and the conditional-UPDATE job
 claim means two workers never take the same job.
+
+Overlapping processes are safe. A claimed job carries a lease
+(`TRANSCODE_LEASE_SECONDS`, default 120) that its worker renews every third of
+that period while ffmpeg runs, and startup recovery reclaims only jobs whose
+lease has lapsed. So a rolling restart, or a worker unit running alongside the
+web app, cannot hand the same video to two ffmpeg processes. Raise the lease if
+a worker can be paused long enough — heavy swapping, a suspended VM — to miss
+several renewals; the only cost of a longer lease is a slower pickup after a
+genuine crash. The email queue uses the same scheme via `EMAIL_LEASE_SECONDS`.
 
 > **Note:** with `KEEP_RAW_UPLOADS=false` a failed transcode can only be retried
 > while the original is still on disk — which it is, because the original is
@@ -198,10 +207,19 @@ PASSWORD_RESET_TTL_MINUTES=60
 ```
 
 Use port 465 with `SMTP_SSL=true` and `SMTP_STARTTLS=false` for implicit TLS.
-Set `SITE_URL` too, so reset links are built from a value you control rather
-than the request's `Host` header. Send yourself a test invite from
-`/invites/` after enabling this; delivery failures are logged to the journal and
-never lose the invite, since the link is still shown on screen.
+
+> **`SITE_URL` is required once SMTP is on.** Every link that goes into an email
+> is built from it. The only other source of a hostname is the request's `Host`
+> header, which the client controls and the shipped nginx config forwards
+> verbatim — a password reset link built that way is a host-header injection:
+> an attacker requests a reset for someone else with `Host: evil.test`, and the
+> victim is emailed a genuine token pointing at the attacker's domain. With SMTP
+> enabled and `SITE_URL` unset, password recovery is refused, invites cannot be
+> emailed, notifications are skipped, and the admin dashboard shows a warning.
+
+Send yourself a test invite from `/invites/` after enabling this; delivery
+failures are logged to the journal and never lose the invite, since the link is
+still shown on screen.
 
 ### New-video notifications
 

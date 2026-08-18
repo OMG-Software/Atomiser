@@ -333,17 +333,44 @@ async def test_one_bad_address_does_not_block_the_rest(db, member_user, mail_con
 
 
 @pytest.mark.asyncio
-async def test_requeue_orphans_recovers_in_flight_messages(db, member_user, mail_configured):
+async def test_requeue_orphans_recovers_messages_with_an_expired_lease(db, member_user, mail_configured):
+    from datetime import timedelta
+
+    from app.utils import now_utc
+
     owner_id = await _user_id(db, member_user["email"])
     await _add_member(db, "a@example.com")
     video_id, _ = await _ready_video(db, owner_id)
     await notifications.queue_new_video_notifications(db, video_id)
     await notifications._claim_batch(db)
 
+    await db.execute(
+        "UPDATE email_queue SET lease_expires_at = ?",
+        ((now_utc() - timedelta(seconds=1)).isoformat(),),
+    )
+    await db.commit()
+
     assert await notifications.requeue_orphans(db) == 1
 
     cursor = await db.execute("SELECT status FROM email_queue")
     assert (await cursor.fetchone())["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_requeue_orphans_leaves_in_flight_messages_alone(db, member_user, mail_configured):
+    """Reclaiming a batch another worker is mid-send on would double-send it."""
+    owner_id = await _user_id(db, member_user["email"])
+    await _add_member(db, "a@example.com")
+    video_id, _ = await _ready_video(db, owner_id)
+    await notifications.queue_new_video_notifications(db, video_id)
+    await notifications._claim_batch(db)
+
+    assert await notifications.requeue_orphans(db) == 0
+
+    cursor = await db.execute("SELECT status, worker_id FROM email_queue")
+    row = await cursor.fetchone()
+    assert row["status"] == "sending"
+    assert row["worker_id"] == notifications.WORKER_ID
 
 
 @pytest.mark.asyncio
