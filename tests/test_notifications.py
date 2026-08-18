@@ -606,3 +606,114 @@ def test_no_unsubscribe_headers_on_transactional_mail(monkeypatch):
     monkeypatch.setattr(Config, "SMTP_FROM", "atomiser@example.com")
     message = mail._build_message("someone@example.com", "Reset", "body", "Atomiser Site")
     assert message["List-Unsubscribe"] is None
+
+
+# ---------------------------------------------------------------------------
+# Fan-out atomicity
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_failed_fan_out_rolls_back_the_claim(db, member_user, mail_configured):
+    """Committing the claim before the inserts would lose notifications forever.
+
+    If notified_at were committed first and the inserts then failed, every retry
+    would return early and nobody would ever be told about the video.
+    """
+    owner_id = await _user_id(db, member_user["email"])
+    await _add_member(db, "a@example.com")
+    await _add_member(db, "b@example.com")
+    video_id, _ = await _ready_video(db, owner_id)
+
+    real_execute = db.execute
+    state = {"inserts": 0, "armed": True}
+
+    async def failing_execute(sql, *args, **kwargs):
+        if state["armed"] and "INSERT INTO email_queue" in sql:
+            state["inserts"] += 1
+            if state["inserts"] == 2:
+                raise RuntimeError("disk full")
+        return await real_execute(sql, *args, **kwargs)
+
+    # Patch the instance directly and disarm afterwards. monkeypatch.undo()
+    # would also revert the mail_configured fixture's settings, since pytest
+    # hands both the fixture and the test the same monkeypatch instance.
+    db.execute = failing_execute
+    try:
+        with pytest.raises(RuntimeError):
+            await notifications.queue_new_video_notifications(db, video_id)
+    finally:
+        state["armed"] = False
+
+    # The claim went back with the partial fan-out.
+    cursor = await db.execute("SELECT notified_at FROM videos WHERE id = ?", (video_id,))
+    assert (await cursor.fetchone())["notified_at"] is None
+    cursor = await db.execute("SELECT COUNT(*) AS c FROM email_queue")
+    assert (await cursor.fetchone())["c"] == 0
+
+    # So a retry can still deliver it.
+    assert await notifications.queue_new_video_notifications(db, video_id) == 2
+
+
+# ---------------------------------------------------------------------------
+# Batch delivery accounting
+# ---------------------------------------------------------------------------
+
+def test_quit_failure_does_not_fail_accepted_messages(monkeypatch):
+    """smtplib raises if the server answers QUIT with anything but 221.
+
+    Treating that as "everything failed" requeues messages the server already
+    accepted, so the next pass delivers them a second time.
+    """
+    import smtplib
+
+    from app import mail as mail_module
+
+    sent = []
+
+    class FakeSMTP:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            raise smtplib.SMTPResponseException(451, b"closing connection failed")
+
+        def send_message(self, message):
+            sent.append(message["To"])
+
+    monkeypatch.setattr(mail_module, "_connect_sync", lambda: FakeSMTP())
+
+    messages = [mail_module._build_message(f"u{i}@example.com", "s", "b", "Site")
+                for i in range(3)]
+    failures = mail_module._send_batch_sync(messages)
+
+    assert len(sent) == 3, "all three were handed to the server"
+    assert failures == {}, f"accepted messages must not be retried, got {failures}"
+
+
+def test_connection_failure_fails_only_unsent_messages(monkeypatch):
+    """A mid-batch connection loss retries the remainder, not the delivered ones."""
+    from app import mail as mail_module
+
+    class FakeSMTP:
+        def __init__(self):
+            self.count = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def send_message(self, message):
+            self.count += 1
+            if self.count == 2:
+                raise OSError("connection reset")
+
+    monkeypatch.setattr(mail_module, "_connect_sync", lambda: FakeSMTP())
+
+    messages = [mail_module._build_message(f"u{i}@example.com", "s", "b", "Site")
+                for i in range(4)]
+    failures = mail_module._send_batch_sync(messages)
+
+    assert 0 not in failures, "the first message was accepted"
+    assert set(failures) == {1, 2, 3}

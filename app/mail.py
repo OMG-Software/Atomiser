@@ -122,36 +122,52 @@ def _send_sync(message: EmailMessage) -> None:
         client.send_message(message)
 
 
-def _send_batch_sync(messages: list) -> list:
+def _send_batch_sync(messages: list) -> dict:
     """Send several messages over one connection.
 
-    Returns a list of (index, error) for the ones that failed. A per-recipient
+    Returns ``{index: error}`` for the ones that failed. A per-recipient
     rejection does not abort the batch; a connection-level failure marks every
-    remaining message as failed so they are all retried together.
+    *remaining* message as failed so they are retried together.
+
+    Acceptance is tracked explicitly rather than inferred from the absence of a
+    failure. Closing the connection can raise on its own - smtplib raises if the
+    server answers QUIT with anything but 221 - and treating that as "everything
+    failed" would requeue messages the server had already accepted, delivering
+    them twice on the next pass.
     """
-    failures = []
+    failures = {}
+    accepted = set()
+
     try:
         client = _connect_sync()
     except Exception as exc:  # noqa: BLE001 - reported per message, not raised
-        return [(i, f"SMTP connection failed: {exc}") for i in range(len(messages))]
+        return {i: f"SMTP connection failed: {exc}" for i in range(len(messages))}
 
     try:
         with client:
             for index, message in enumerate(messages):
                 try:
                     client.send_message(message)
+                    accepted.add(index)
                 except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused,
                         smtplib.SMTPDataError) as exc:
                     # A bad address should not stop the rest of the batch.
-                    failures.append((index, str(exc)))
+                    failures[index] = str(exc)
                 except Exception as exc:  # noqa: BLE001 - connection is suspect now
-                    failures.append((index, str(exc)))
+                    failures[index] = str(exc)
                     for remaining in range(index + 1, len(messages)):
-                        failures.append((remaining, "connection lost earlier in batch"))
+                        failures[remaining] = "connection lost earlier in batch"
                     break
-    except Exception as exc:  # noqa: BLE001
-        sent = {i for i, _ in failures}
-        failures.extend((i, str(exc)) for i in range(len(messages)) if i not in sent)
+    except Exception as exc:  # noqa: BLE001 - typically a failed QUIT
+        # Only messages the server never accepted are retried.
+        for index in range(len(messages)):
+            if index not in accepted and index not in failures:
+                failures[index] = str(exc)
+        if accepted:
+            logger.warning(
+                "SMTP connection close failed after %d message(s) were accepted; "
+                "those are not being retried: %s", len(accepted), exc,
+            )
 
     return failures
 
@@ -202,7 +218,7 @@ async def send_batch(items: list, site_title: str = "Atomiser") -> dict:
     failures = await run_in_threadpool(_send_batch_sync, messages)
     if failures:
         logger.warning("%d of %d messages in batch failed", len(failures), len(messages))
-    return dict(failures)
+    return failures
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +234,22 @@ async def send_invite(to_address: str, invite_url: str, site_title: str, inviter
         f"If you were not expecting this invitation you can ignore this message.\n"
     )
     return await send_mail(to_address, f"You have been invited to {site_title}", body, site_title)
+
+
+def password_reset_message(reset_url: str, site_title: str, ttl_minutes: int):
+    """Subject and body for a reset email, without sending it.
+
+    Kept separate from delivery because /auth/forgot queues the message rather
+    than sending it inline - see the note in app/auth.py.
+    """
+    body = (
+        f"Someone asked to reset the password for your {site_title} account.\n\n"
+        f"Set a new password here:\n{reset_url}\n\n"
+        f"This link expires in {ttl_minutes} minutes and can only be used once.\n\n"
+        f"If you did not request this, you can ignore this message - your password "
+        f"has not been changed.\n"
+    )
+    return f"Reset your {site_title} password", body
 
 
 async def send_password_reset(to_address: str, reset_url: str, site_title: str, ttl_minutes: int) -> bool:

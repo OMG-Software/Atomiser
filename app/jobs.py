@@ -177,40 +177,101 @@ async def _claim_job(db):
         # Another worker won the race; look for the next one.
 
 
-async def _finish_job(db, job_id: int, status: str, error: str = None):
-    await db.execute(
+async def _finish_job(db, job_id: int, status: str, error: str = None) -> bool:
+    """Record a job's outcome. Returns False if we no longer own it.
+
+    Ownership-scoped so a worker that lost its lease cannot overwrite the state
+    of whichever process holds the job now.
+    """
+    cursor = await db.execute(
         """
         UPDATE transcode_jobs
         SET status = ?, finished_at = ?, last_error = ?, lease_expires_at = NULL
-        WHERE id = ?
+        WHERE id = ? AND (worker_id = ? OR worker_id IS NULL)
         """,
-        (status, now_utc().isoformat(), error, job_id),
+        (status, now_utc().isoformat(), error, job_id, WORKER_ID),
     )
     await db.commit()
+    if cursor.rowcount == 0:
+        logger.warning("Not recording outcome for job %s: it is owned by another worker", job_id)
+        return False
+    return True
 
 
 async def _heartbeat(job_id: int) -> None:
-    """Renew a job's lease while it transcodes.
+    """Renew a job's lease for as long as it transcodes.
 
     Uses its own connection: the worker's connection is busy awaiting ffmpeg,
     and interleaving statements on one aiosqlite connection from two tasks is
     asking for trouble.
+
+    A renewal failure must not end the loop. ffmpeg keeps running regardless, so
+    giving up after one transient error (a locked database, a brief I/O stall)
+    would let the lease lapse under a live job - and an overlapping process would
+    then reclaim it, which is precisely the double-transcode the lease exists to
+    prevent. Errors are retried, on a fresh connection if the old one is broken.
     """
     db = await _connect()
+    consecutive_failures = 0
     try:
         while True:
-            await asyncio.sleep(_heartbeat_interval())
-            await db.execute(
-                "UPDATE transcode_jobs SET lease_expires_at = ? WHERE id = ? AND status = 'running'",
-                (_lease_deadline(), job_id),
-            )
-            await db.commit()
+            # Retry sooner than the normal cadence after a failure, so a blip
+            # costs a fraction of the lease rather than the whole of it.
+            if consecutive_failures:
+                delay = min(_heartbeat_interval(),
+                            max(1.0, Config.TRANSCODE_LEASE_SECONDS / 10))
+            else:
+                delay = _heartbeat_interval()
+            await asyncio.sleep(delay)
+
+            try:
+                # Scoped to this worker: if the lease lapsed and another process
+                # claimed the job, rowcount is 0 and we have lost ownership.
+                cursor = await db.execute(
+                    """
+                    UPDATE transcode_jobs SET lease_expires_at = ?
+                    WHERE id = ? AND status = 'running' AND worker_id = ?
+                    """,
+                    (_lease_deadline(), job_id, WORKER_ID),
+                )
+                await db.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep trying, do not exit
+                consecutive_failures += 1
+                logger.warning(
+                    "Lease renewal for job %s failed (attempt %s): %s",
+                    job_id, consecutive_failures, exc,
+                )
+                # A broken connection never heals by itself; replace it.
+                try:
+                    await db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    db = await _connect()
+                except Exception as reconnect_exc:  # noqa: BLE001
+                    logger.warning("Heartbeat could not reconnect: %s", reconnect_exc)
+                continue
+
+            consecutive_failures = 0
+            if cursor.rowcount == 0:
+                # Either the job already finished (we are about to be cancelled)
+                # or another process took it. Stop renewing either way; the
+                # ownership checks in _finish_job/_handle_failure keep us from
+                # writing over whoever owns it now.
+                logger.warning(
+                    "Job %s is no longer owned by %s; stopping lease renewal",
+                    job_id, WORKER_ID,
+                )
+                return
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 - a failed renewal must not kill the job
-        logger.exception("Heartbeat failed for job %s", job_id)
     finally:
-        await db.close()
+        try:
+            await db.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _run_job(db, job) -> None:
@@ -272,15 +333,19 @@ async def _notify_subscribers(db, video_id: int) -> None:
 async def _handle_failure(db, job, error: str) -> None:
     """Requeue while attempts remain, otherwise mark the video failed."""
     if job["attempts"] < Config.TRANSCODE_MAX_ATTEMPTS:
-        await db.execute(
+        cursor = await db.execute(
             """
             UPDATE transcode_jobs
             SET status = 'queued', started_at = NULL, last_error = ?,
                 worker_id = NULL, lease_expires_at = NULL
-            WHERE id = ?
+            WHERE id = ? AND (worker_id = ? OR worker_id IS NULL)
             """,
-            (error, job["id"]),
+            (error, job["id"], WORKER_ID),
         )
+        if cursor.rowcount == 0:
+            await db.rollback()
+            logger.warning("Not requeueing job %s: it is owned by another worker", job["id"])
+            return
         await db.execute(
             "UPDATE videos SET status = 'uploading' WHERE id = ?", (job["video_id"],)
         )
@@ -291,7 +356,8 @@ async def _handle_failure(db, job, error: str) -> None:
         )
         return
 
-    await _finish_job(db, job["id"], "failed", error)
+    if not await _finish_job(db, job["id"], "failed", error):
+        return
     await db.execute("UPDATE videos SET status = 'failed' WHERE id = ?", (job["video_id"],))
     await db.commit()
     logger.error("Transcode job %s failed permanently: %s", job["id"], error)

@@ -134,6 +134,32 @@ def _body(site_title: str, video, uploader: str, video_url: str, unsubscribe_url
     return "\n".join(lines) + "\n"
 
 
+async def enqueue_email(db, to_address: str, subject: str, body: str,
+                        kind: str = "notification", user_id: int = None,
+                        commit: bool = True) -> bool:
+    """Put one message on the outbound queue.
+
+    Used for transactional mail (password resets) as well as notifications, so
+    that a request never waits on an SMTP round trip. Returns False when mail is
+    not configured, in which case nothing is queued.
+    """
+    if not mail.mail_enabled():
+        return False
+
+    stamp = now_utc().isoformat()
+    await db.execute(
+        """
+        INSERT INTO email_queue
+            (user_id, to_address, subject, body, kind, status, scheduled_for, created_at)
+        VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+        """,
+        (user_id, to_address, subject, body, kind, stamp, stamp),
+    )
+    if commit:
+        await db.commit()
+    return True
+
+
 async def queue_new_video_notifications(db, video_id: int) -> int:
     """Queue a notification per subscriber for a newly visible video.
 
@@ -170,16 +196,6 @@ async def queue_new_video_notifications(db, video_id: int) -> int:
         )
         return 0
 
-    # Claim the fan-out. rowcount == 1 means this call owns it.
-    stamp = now_utc().isoformat()
-    cursor = await db.execute(
-        "UPDATE videos SET notified_at = ? WHERE id = ? AND notified_at IS NULL",
-        (stamp, video_id),
-    )
-    await db.commit()
-    if cursor.rowcount != 1:
-        return 0
-
     cursor = await db.execute(
         """
         SELECT id, email FROM users
@@ -189,37 +205,63 @@ async def queue_new_video_notifications(db, video_id: int) -> int:
         (video["owner_id"],),
     )
     recipients = [dict(r) for r in await cursor.fetchall()]
-    if not recipients:
-        return 0
 
     site_title = await _site_title(db)
-    uploader = video["owner_name"] or video["owner_email"]
-    video_url = _site_link(f"/videos/{video['uuid']}")
-    subject = f"New video on {site_title}: {video['title']}"
 
-    queued = 0
-    for recipient in recipients:
-        token = await unsubscribe_token(db, recipient["id"])
-        unsubscribe_url = _site_link(f"/notifications/unsubscribe?token={token}")
-        await db.execute(
-            """
-            INSERT INTO email_queue
-                (user_id, to_address, subject, body, kind, status, scheduled_for, created_at)
-            VALUES (?, ?, ?, ?, 'new_video', 'queued', ?, ?)
-            """,
-            (
-                recipient["id"],
-                recipient["email"],
-                subject,
-                _body(site_title, video, uploader, video_url, unsubscribe_url),
-                stamp,
-                stamp,
-            ),
-        )
-        queued += 1
+    # Make sure every recipient has an unsubscribe token *before* the claim.
+    # unsubscribe_token() commits when it mints one, which would otherwise split
+    # the transaction below in half.
+    tokens = {r["id"]: await unsubscribe_token(db, r["id"]) for r in recipients}
 
-    await db.commit()
-    logger.info("Queued %d new-video notification(s) for %s", queued, video["uuid"])
+    # Claim and fan out in one transaction. Committing the claim first would mean
+    # a crash (or any error) between the two left notified_at set with no queue
+    # rows written - every retry would then return early and those notifications
+    # would be lost for good. Rolling back together keeps the work retryable.
+    stamp = now_utc().isoformat()
+    cursor = await db.execute(
+        "UPDATE videos SET notified_at = ? WHERE id = ? AND notified_at IS NULL",
+        (stamp, video_id),
+    )
+    if cursor.rowcount != 1:
+        await db.rollback()
+        return 0
+
+    try:
+        uploader = video["owner_name"] or video["owner_email"]
+        video_url = _site_link(f"/videos/{video['uuid']}")
+        subject = f"New video on {site_title}: {video['title']}"
+
+        queued = 0
+        for recipient in recipients:
+            unsubscribe_url = _site_link(
+                f"/notifications/unsubscribe?token={tokens[recipient['id']]}"
+            )
+            await db.execute(
+                """
+                INSERT INTO email_queue
+                    (user_id, to_address, subject, body, kind, status, scheduled_for, created_at)
+                VALUES (?, ?, ?, ?, 'new_video', 'queued', ?, ?)
+                """,
+                (
+                    recipient["id"],
+                    recipient["email"],
+                    subject,
+                    _body(site_title, video, uploader, video_url, unsubscribe_url),
+                    stamp,
+                    stamp,
+                ),
+            )
+            queued += 1
+
+        await db.commit()
+    except Exception:
+        # Drop the claim along with the partial fan-out so a retry can redo it.
+        await db.rollback()
+        logger.exception("Fan-out failed for video %s; claim rolled back", video["uuid"])
+        raise
+
+    if queued:
+        logger.info("Queued %d new-video notification(s) for %s", queued, video["uuid"])
     return queued
 
 
@@ -235,11 +277,13 @@ async def _claim_batch(db) -> list:
     status = 'queued' predicate is the concurrency gate against a second worker.
     """
     now = now_utc().isoformat()
+    # Transactional mail (password resets) goes ahead of bulk notifications, so
+    # a large fan-out cannot leave someone waiting on a reset link.
     cursor = await db.execute(
         """
         SELECT id FROM email_queue
         WHERE status = 'queued' AND scheduled_for <= ?
-        ORDER BY id
+        ORDER BY CASE WHEN kind = 'new_video' THEN 1 ELSE 0 END, id
         LIMIT ?
         """,
         (now, Config.EMAIL_BATCH_SIZE),
@@ -260,7 +304,7 @@ async def _claim_batch(db) -> list:
         return []
 
     cursor = await db.execute(
-        f"SELECT id, user_id, to_address, subject, body, attempts FROM email_queue "
+        f"SELECT id, user_id, to_address, subject, body, kind, attempts FROM email_queue "
         f"WHERE id IN ({placeholders}) AND status = 'sending' ORDER BY id",
         ids,
     )
@@ -310,15 +354,20 @@ async def _send_batch(db, batch: list) -> None:
     site_title = await _site_title(db)
     items = []
     for message in batch:
-        token = await unsubscribe_token(db, message["user_id"]) if message["user_id"] else ""
+        # Only bulk mail carries List-Unsubscribe. Offering to unsubscribe from
+        # a password reset would be meaningless, and worse, it would let the
+        # header turn off someone's notifications from a transactional message.
+        unsubscribe_url = None
+        if message["kind"] == "new_video" and message["user_id"] and Config.SITE_URL:
+            token = await unsubscribe_token(db, message["user_id"])
+            if token:
+                unsubscribe_url = _site_link(f"/notifications/unsubscribe?token={token}")
+
         items.append({
             "to_address": message["to_address"],
             "subject": message["subject"],
             "body": message["body"],
-            "unsubscribe_url": (
-                _site_link(f"/notifications/unsubscribe?token={token}")
-                if token and Config.SITE_URL else None
-            ),
+            "unsubscribe_url": unsubscribe_url,
         })
 
     failures = await mail.send_batch(items, site_title)

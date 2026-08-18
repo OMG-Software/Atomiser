@@ -224,6 +224,15 @@ Send yourself a test invite from `/invites/` after enabling this; delivery
 failures are logged to the journal and never lose the invite, since the link is
 still shown on screen.
 
+> **Password reset emails go through the queue worker.** `/auth/forgot` writes
+> the message to `email_queue` and returns immediately rather than waiting on
+> SMTP — an inline send makes the response measurably slower for a registered
+> address than an unknown one, which is enough to enumerate accounts. The
+> practical consequence is that `RUN_EMAIL_WORKER=false` with no separate worker
+> process means reset emails are written but never delivered. Leave the worker
+> enabled somewhere. Transactional mail is sent ahead of bulk notifications, so
+> a large fan-out cannot delay a reset link.
+
 ### New-video notifications
 
 With SMTP configured, members are emailed whenever a video finishes processing
@@ -672,6 +681,24 @@ Jobs survive a restart, so this is almost always a real ffmpeg failure rather
 than a lost task. Check the failed-transcode list on the admin dashboard for the
 error, then retry it from there. A job left `running` by a hard kill is requeued
 automatically the next time the service starts.
+
+### Password reset emails are not arriving
+
+Resets are queued and delivered by the email worker, not sent during the
+request, so check the queue rather than assuming SMTP is broken:
+
+```bash
+sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db \
+    "SELECT id, to_address, status, attempts, last_error FROM email_queue WHERE kind = 'password_reset' ORDER BY id DESC LIMIT 10;"
+```
+
+- Rows stuck at `queued` with `attempts = 0` mean no worker is running. Check
+  `RUN_EMAIL_WORKER` and look for `Started email queue worker` in the journal.
+- Rows at `queued` with rising `attempts` mean the SMTP server is rejecting
+  them; `last_error` carries the reason.
+- No row at all means the request was refused before a token was minted — most
+  often `SITE_URL` unset, which is logged as an error and shown on the admin
+  dashboard.
 
 ### Notification emails are not arriving
 

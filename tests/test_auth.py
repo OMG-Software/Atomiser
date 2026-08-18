@@ -642,7 +642,12 @@ async def test_forgot_post_refused_when_mail_is_off(client, csrf, member_user):
 
 @pytest.fixture
 def mail_configured(monkeypatch):
-    """Pretend SMTP is set up, but capture messages instead of sending them."""
+    """Pretend SMTP is set up, capturing anything that would be delivered.
+
+    Patches both delivery entry points, because transactional mail now goes out
+    through the queue worker's batch send rather than inline. Captured entries
+    share the batch shape so assertions do not depend on which path was used.
+    """
     from app import mail
     from app.config import Config
 
@@ -653,11 +658,19 @@ def mail_configured(monkeypatch):
 
     sent = []
 
-    async def _capture(to_address, subject, body, site_title="Atomiser"):
-        sent.append({"to": to_address, "subject": subject, "body": body})
+    async def _capture_one(to_address, subject, body, site_title="Atomiser", unsubscribe_url=None):
+        sent.append({
+            "to_address": to_address, "subject": subject,
+            "body": body, "unsubscribe_url": unsubscribe_url,
+        })
         return True
 
-    monkeypatch.setattr(mail, "send_mail", _capture)
+    async def _capture_batch(items, site_title="Atomiser"):
+        sent.extend(items)
+        return {}
+
+    monkeypatch.setattr(mail, "send_mail", _capture_one)
+    monkeypatch.setattr(mail, "send_batch", _capture_batch)
     return sent
 
 
@@ -667,8 +680,16 @@ async def test_forgot_sends_a_reset_link(client, csrf, member_user, mail_configu
         "/auth/forgot", data={"email": member_user["email"], "csrf": csrf}
     )
     assert resp.status_code == 200
-    assert len(mail_configured) == 1
-    assert "/auth/reset?token=" in mail_configured[0]["body"]
+
+    # Queued, not sent inline.
+    assert mail_configured == []
+    cursor = await db.execute(
+        "SELECT to_address, kind, body FROM email_queue WHERE kind = 'password_reset'"
+    )
+    rows = [dict(r) for r in await cursor.fetchall()]
+    assert len(rows) == 1
+    assert rows[0]["to_address"] == member_user["email"]
+    assert "/auth/reset?token=" in rows[0]["body"]
 
     cursor = await db.execute("SELECT COUNT(*) AS c FROM password_resets")
     assert (await cursor.fetchone())["c"] == 1
@@ -685,6 +706,28 @@ async def test_forgot_response_is_identical_for_unknown_email(client, csrf, mail
 
     cursor = await db.execute("SELECT COUNT(*) AS c FROM password_resets")
     assert (await cursor.fetchone())["c"] == 0
+    cursor = await db.execute("SELECT COUNT(*) AS c FROM email_queue")
+    assert (await cursor.fetchone())["c"] == 0
+
+
+def _queued_reset_body():
+    """Body of the most recent queued password-reset email.
+
+    /auth/forgot enqueues rather than sending inline (an inline SMTP round trip
+    is an enumeration oracle by timing), so the message lands in email_queue.
+    """
+    import sqlite3
+
+    from app.config import Config
+
+    conn = sqlite3.connect(Config.DATABASE_PATH)
+    try:
+        row = conn.execute(
+            "SELECT body FROM email_queue WHERE kind = 'password_reset' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else ""
 
 
 def _token_from(body):
@@ -694,7 +737,7 @@ def _token_from(body):
 @pytest.mark.asyncio
 async def test_reset_token_sets_new_password(client, csrf, member_user, mail_configured, db):
     await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
-    token = _token_from(mail_configured[0]["body"])
+    token = _token_from(_queued_reset_body())
 
     page = await client.get(f"/auth/reset?token={token}")
     assert page.status_code == 200
@@ -727,7 +770,7 @@ async def test_reset_token_sets_new_password(client, csrf, member_user, mail_con
 @pytest.mark.asyncio
 async def test_reset_token_is_single_use(client, csrf, member_user, mail_configured):
     await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
-    token = _token_from(mail_configured[0]["body"])
+    token = _token_from(_queued_reset_body())
 
     payload = {
         "token": token,
@@ -750,7 +793,7 @@ async def test_expired_reset_token_is_rejected(client, csrf, member_user, mail_c
     from app.utils import now_utc
 
     await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
-    token = _token_from(mail_configured[0]["body"])
+    token = _token_from(_queued_reset_body())
 
     await db.execute(
         "UPDATE password_resets SET expires_at = ?",
@@ -774,7 +817,7 @@ async def test_expired_reset_token_is_rejected(client, csrf, member_user, mail_c
 @pytest.mark.asyncio
 async def test_reset_rejects_weak_password(client, csrf, member_user, mail_configured):
     await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
-    token = _token_from(mail_configured[0]["body"])
+    token = _token_from(_queued_reset_body())
 
     resp = await client.post(
         "/auth/reset",
@@ -788,7 +831,7 @@ async def test_reset_rejects_weak_password(client, csrf, member_user, mail_confi
 @pytest.mark.asyncio
 async def test_reset_rejects_mismatched_confirmation(client, csrf, member_user, mail_configured):
     await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
-    token = _token_from(mail_configured[0]["body"])
+    token = _token_from(_queued_reset_body())
 
     resp = await client.post(
         "/auth/reset",
@@ -814,7 +857,7 @@ async def test_reset_revokes_existing_sessions(client, csrf, member_user, mail_c
     await create_session(db, user_id, "10.0.0.9", "stale device")
 
     await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
-    token = _token_from(mail_configured[0]["body"])
+    token = _token_from(_queued_reset_body())
     await client.post(
         "/auth/reset",
         data={
@@ -833,7 +876,7 @@ async def test_reset_revokes_existing_sessions(client, csrf, member_user, mail_c
 @pytest.mark.asyncio
 async def test_reset_requires_csrf(client, member_user, mail_configured, csrf):
     await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
-    token = _token_from(mail_configured[0]["body"])
+    token = _token_from(_queued_reset_body())
 
     resp = await client.post(
         "/auth/reset",
@@ -866,7 +909,7 @@ async def test_reset_link_ignores_a_spoofed_host_header(client, csrf, member_use
     )
     assert resp.status_code == 200
 
-    body = mail_configured[0]["body"]
+    body = _queued_reset_body()
     assert "https://videos.example.com/auth/reset?token=" in body
     assert "evil.test" not in body
 
@@ -946,3 +989,58 @@ async def test_success_clears_failures_recorded_under_mixed_case(
         follow_redirects=False,
     )
     assert resp.status_code == 303
+
+
+# ---------------------------------------------------------------------------
+# Reset delivery must not leak account existence through timing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_forgot_does_not_block_on_smtp(client, csrf, member_user, mail_configured, monkeypatch):
+    """A registered address used to await a real SMTP round trip while an
+    unknown one returned immediately, so response time alone distinguished
+    them. Delivery is queued now, so neither touches SMTP in-request."""
+    import time
+
+    from app import mail as mail_module
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("SMTP must not be contacted during the request")
+
+    # Any attempt to open a connection during the request now fails loudly.
+    monkeypatch.setattr(mail_module, "_connect_sync", _explode)
+
+    started = time.monotonic()
+    known = await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
+    known_elapsed = time.monotonic() - started
+
+    started = time.monotonic()
+    unknown = await client.post("/auth/forgot", data={"email": "nobody@example.com", "csrf": csrf})
+    unknown_elapsed = time.monotonic() - started
+
+    assert known.status_code == unknown.status_code == 200
+    assert known.text == unknown.text
+    # Both paths are now pure database work; a whole second of difference would
+    # mean something is still blocking on the network.
+    assert abs(known_elapsed - unknown_elapsed) < 1.0
+
+
+@pytest.mark.asyncio
+async def test_queued_reset_is_deliverable_by_the_worker(client, csrf, member_user, mail_configured, db):
+    """The queued message must actually go out, and without unsubscribe headers."""
+    from app import notifications
+
+    await client.post("/auth/forgot", data={"email": member_user["email"], "csrf": csrf})
+
+    batch = await notifications._claim_batch(db)
+    assert len(batch) == 1
+    await notifications._send_batch(db, batch)
+
+    assert len(mail_configured) == 1
+    sent = mail_configured[0]
+    assert sent["to_address"] == member_user["email"]
+    # Transactional mail carries no List-Unsubscribe.
+    assert sent.get("unsubscribe_url") is None
+
+    cursor = await db.execute("SELECT status FROM email_queue WHERE kind = 'password_reset'")
+    assert (await cursor.fetchone())["status"] == "sent"

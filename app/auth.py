@@ -21,7 +21,7 @@ from fido2.webauthn import (
 from fido2.utils import websafe_decode, websafe_encode
 from starlette.concurrency import run_in_threadpool
 
-from app import mail, ratelimit
+from app import mail, notifications, ratelimit
 from app.config import Config
 from app.db import get_db
 from app.models import LoginForm, RegisterForm, TOTPChallengeForm
@@ -524,15 +524,22 @@ async def forgot_post(
             """,
             (hash_token(token), user["id"], expires.isoformat(), client_ip),
         )
-        await db.commit()
-        await _audit(db, user["id"], "password_reset_requested", request=request)
-
-        await mail.send_password_reset(
-            user["email"],
+        # Queued rather than sent inline. Awaiting a real SMTP round trip here
+        # would make this request take seconds for a registered address and
+        # microseconds for an unknown one, and that timing difference is an
+        # account-enumeration oracle regardless of how carefully the response
+        # body is kept identical. The queue worker delivers it a moment later.
+        subject, body = mail.password_reset_message(
             mail.email_link(f"/auth/reset?token={token}"),
             site_title,
             Config.PASSWORD_RESET_TTL_MINUTES,
         )
+        await notifications.enqueue_email(
+            db, user["email"], subject, body, kind="password_reset", user_id=user["id"],
+            commit=False,
+        )
+        await db.commit()
+        await _audit(db, user["id"], "password_reset_requested", request=request)
 
     # Identical response either way.
     return templates.TemplateResponse(

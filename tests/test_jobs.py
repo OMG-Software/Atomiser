@@ -285,3 +285,90 @@ async def test_upload_enqueues_a_job(client, logged_in_member, csrf):
 
     assert row is not None
     assert row["status"] == "queued"
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat resilience
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_heartbeat_keeps_renewing_after_a_transient_error(db, member_user, monkeypatch):
+    """One failed renewal used to end the loop for good.
+
+    ffmpeg keeps running either way, so the lease would then lapse under a live
+    job and an overlapping process could reclaim it - the exact double-transcode
+    the lease exists to prevent.
+    """
+    import asyncio
+
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "TRANSCODE_LEASE_SECONDS", 30)
+    monkeypatch.setattr("app.jobs._heartbeat_interval", lambda: 0.05)
+
+    owner_id = await _user_id(db)
+    video_id, _ = await _create_video(db, owner_id)
+    await jobs.enqueue(db, video_id)
+    job = await jobs._claim_job(db)
+
+    calls = {"n": 0}
+    real_connect = jobs._connect
+
+    class FlakyConnection:
+        """Fails the first two renewals, then behaves."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        async def execute(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise RuntimeError("database is locked")
+            return await self._inner.execute(*args, **kwargs)
+
+        async def commit(self):
+            return await self._inner.commit()
+
+        async def close(self):
+            return await self._inner.close()
+
+    async def flaky_connect():
+        return FlakyConnection(await real_connect())
+
+    monkeypatch.setattr(jobs, "_connect", flaky_connect)
+
+    task = asyncio.create_task(jobs._heartbeat(job["id"]))
+    await asyncio.sleep(0.9)
+    still_running = not task.done()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert calls["n"] > 2, "heartbeat gave up instead of retrying"
+    assert still_running, "heartbeat exited after a transient error"
+
+
+@pytest.mark.asyncio
+async def test_a_worker_that_lost_its_job_does_not_overwrite_the_new_owner(db, member_user):
+    """Ownership-scoped writes: a straggler must not clobber the live owner."""
+    owner_id = await _user_id(db)
+    video_id, _ = await _create_video(db, owner_id)
+    job_id = await jobs.enqueue(db, video_id)
+    job = await jobs._claim_job(db)
+
+    # Another process takes it over.
+    await db.execute(
+        "UPDATE transcode_jobs SET worker_id = 'someone-else' WHERE id = ?", (job["id"],)
+    )
+    await db.commit()
+
+    assert await jobs._finish_job(db, job["id"], "done") is False
+
+    cursor = await db.execute(
+        "SELECT status, worker_id FROM transcode_jobs WHERE id = ?", (job["id"],)
+    )
+    row = await cursor.fetchone()
+    assert row["status"] == "running"
+    assert row["worker_id"] == "someone-else"
