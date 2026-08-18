@@ -13,13 +13,16 @@ The example domain used below is `example.com`. Replace it with your own domain 
 - `ffmpeg` and `ffprobe` installed.
 - `nginx`.
 - `certbot` and the nginx plugin.
+- The `sqlite3` command-line tool, used by the backup, upgrade and
+  troubleshooting steps below. The Python bindings are built in, but the CLI is
+  a separate package and a minimal server may not have it.
 - A domain name pointed at your server.
 
 Install the base dependencies with `dnf`:
 
 ```bash
 sudo dnf update -y
-sudo dnf install -y python3 python3-pip python3-venv ffmpeg nginx
+sudo dnf install -y python3 python3-pip python3-venv ffmpeg nginx sqlite
 sudo dnf install -y certbot python3-certbot-nginx
 ```
 
@@ -431,6 +434,112 @@ sudo systemctl restart atomiser
 
 Always back up the database before a major update (see Backups below). `init_db()` applies any new migration scripts from `db/migrations/` on the restart.
 
+That is the routine case. Upgrading an existing site **across a feature release**
+needs a few decisions first — see the next section.
+
+### Upgrading an existing site
+
+The schema upgrade itself is automatic and non-destructive: `init_db()` applies
+every migration on startup, all of them idempotent, so a restart (or three)
+changes nothing beyond adding the new tables and columns. Existing rows are
+preserved exactly, including password hashes, TOTP secrets and passkey
+credentials. Nobody is signed out and no invite is invalidated.
+
+What does need attention is the handful of settings that change *behaviour*, and
+one surprise involving email.
+
+#### 1. Back up, with the service stopped
+
+```bash
+sudo systemctl stop atomiser
+sudo tar czf /root/atomiser-backup-$(date +%F).tar.gz     /opt/atomiser/data /opt/atomiser/uploads /etc/atomiser/atomiser.env
+```
+
+Stopping first matters: the database runs in WAL mode, so copying it hot can
+capture a torn state. This archive is the only rollback path for the media
+files, so do not skip it.
+
+#### 2. Decide three settings before the first start
+
+Edit `/etc/atomiser/atomiser.env` while the service is still stopped.
+
+| Setting | Why it matters when upgrading |
+|---|---|
+| `KEEP_RAW_UPLOADS` | Defaults to `false`. Originals already on disk are left alone, but every *future* transcode deletes its original once a rendition succeeds. Set `true` to keep them. Once an original is purged the admin "retry" button cannot reprocess that video — there is nothing left to encode from. |
+| `SITE_URL` | **Required** as soon as `SMTP_HOST` is set. If you already run SMTP without it, password recovery is refused after the upgrade until you set it. See the Email section above for why the request's `Host` header is not an acceptable substitute. |
+| `NOTIFY_NEW_VIDEOS` | Set `false` for the first boot only. See step 4. |
+
+#### 3. Deploy and start
+
+Follow *Update the application* above, then watch the journal as it comes up:
+
+```bash
+sudo journalctl -u atomiser -f
+```
+
+You should see the migrations apply, then `Started N transcode worker(s)` and
+`Started email queue worker`.
+
+#### 4. Drain the transcode backlog before enabling notifications
+
+Older versions ran transcoding as an in-process background task, which was lost
+whenever the service restarted. An upgraded install therefore usually has
+several videos stranded in `uploading`. Startup recovery finds them and
+transcodes them properly — which is the point — but a completed transcode also
+**emails every member**, so without care the upgrade announces a batch of
+weeks-old uploads.
+
+With `NOTIFY_NEW_VIDEOS=false` from step 2, let the backlog finish (the admin
+dashboard shows the queue draining), then mark everything as already announced:
+
+```bash
+sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db     "UPDATE videos SET notified_at = CURRENT_TIMESTAMP WHERE notified_at IS NULL;"
+```
+
+Then set `NOTIFY_NEW_VIDEOS=true` and restart. This also prevents an old
+*private* video from announcing itself later if someone makes it public.
+
+Note that every existing member is subscribed by default — notifications are
+opt-out. They can turn them off from their profile or via the unsubscribe link
+in any message.
+
+#### 5. Optional: backfill storage figures
+
+`videos.raw_size_bytes` is recorded at upload, so it is empty for videos that
+predate the upgrade and the dashboard's storage total under-reports them.
+Nothing is broken; the number is just low. To correct it from what is on disk:
+
+```bash
+sudo -u atomiser /opt/atomiser/venv/bin/python - <<'PY'
+import os, sqlite3
+db = sqlite3.connect("/opt/atomiser/data/atomiser.db")
+rows = db.execute(
+    "SELECT id, raw_path FROM videos WHERE raw_path IS NOT NULL AND raw_size_bytes IS NULL"
+).fetchall()
+updated = 0
+for video_id, path in rows:
+    # An original that has already been purged has no size to record; skip it.
+    if os.path.exists(path):
+        db.execute("UPDATE videos SET raw_size_bytes = ? WHERE id = ?",
+                   (os.path.getsize(path), video_id))
+        updated += 1
+db.commit()
+print(f"backfilled {updated} of {len(rows)} candidate video(s)")
+PY
+```
+
+#### 6. Rolling back
+
+Every added column is nullable or has a default, and the new tables are simply
+ignored by older code, so the upgraded database stays readable and writable by
+the previous release. Rolling back is just redeploying the old zip — no database
+surgery, and no need to restore the backup unless the files themselves are
+damaged.
+
+The one caveat: anything sitting in `transcode_jobs` or `email_queue` will not
+be processed while the old code is running. It resumes if you roll forward
+again.
+
 ### Update the operating system
 
 ```bash
@@ -440,11 +549,17 @@ sudo systemctl restart atomiser
 
 ### Database migrations
 
-`init_db()` in `app/db.py` runs all migration scripts from `db/migrations/` on every startup, so a normal service restart applies new schema changes. Back up the database before major updates:
+`init_db()` in `app/db.py` runs all migration scripts from `db/migrations/` on every startup, so a normal service restart applies new schema changes. Migrations are idempotent — re-running them is safe.
+
+Back up the database before major updates. The database runs in WAL mode, so use
+SQLite's own backup command rather than `cp`, which can capture a torn state
+while the service is writing:
 
 ```bash
-sudo -u atomiser cp /opt/atomiser/data/atomiser.db /opt/atomiser/data/atomiser.db.bak.$(date +%F)
+sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db     ".backup '/opt/atomiser/data/atomiser.db.bak.$(date +%F)'"
 ```
+
+A plain `cp` is only safe with the service stopped.
 
 ### Backups
 
