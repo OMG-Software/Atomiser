@@ -1,46 +1,110 @@
 {% extends "base.html" %}
 {% block title %}Invites — {{ site_title|default('Atomiser Site') }}{% endblock %}
 {% block content %}
-<h1>Invite links</h1>
+<div class="section-head">
+  <h1>Invite links</h1>
+  <div class="meta">{{ invites|selectattr('is_active')|list|length }} active of {{ invites|length }}</div>
+</div>
 
-<div class="card" style="max-width: 500px;">
-  <h2>Generate a one-time invite</h2>
+{% if request.query_params.get('revoked') %}
+  <div class="alert alert-success">Invite revoked. That link can no longer be used to register.</div>
+{% endif %}
+
+<div class="card" style="max-width: 560px;">
+  <h2>Generate an invite</h2>
   <form method="POST" action="/invites/create">
     <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+
     <label for="expires_hours">Expires in (hours)</label>
     <input type="number" id="expires_hours" name="expires_hours" value="{{ expires_hours|default(48) }}" min="1" max="168" required>
-    <button type="submit" class="btn">Generate</button>
+
+    <label for="max_uses">Number of uses</label>
+    <input type="number" id="max_uses" name="max_uses" value="1" min="1" max="{{ max_uses_limit }}" required>
+    <p class="field-hint">One link that several people can redeem — useful for inviting a group at once.</p>
+
+    <label for="note">Note (optional)</label>
+    <input type="text" id="note" name="note" maxlength="200" placeholder="e.g. for Dave from the film club">
+    <p class="field-hint">Only visible to admins. Helps you remember who a link was meant for.</p>
+
+    {% if mail_enabled %}
+      <label for="send_to">Email it to (optional)</label>
+      <input type="email" id="send_to" name="send_to" placeholder="someone@example.com">
+      <p class="field-hint">Leave blank to just get a link you can share yourself.</p>
+    {% else %}
+      <p class="field-hint" style="margin-top:1rem;">
+        Email delivery is not configured on this server, so you will get a link to share yourself.
+      </p>
+    {% endif %}
+
+    <button type="submit" class="btn" style="margin-top:1.25rem;">Generate</button>
   </form>
+
+  {% if email_status %}
+    <div class="alert alert-{{ email_status[0] }}" style="margin-top:1rem;">{{ email_status[1] }}</div>
+  {% endif %}
 
   {% if new_invite_url %}
     <div class="alert alert-success" style="margin-top: 1rem;">
-      New invite link:
-      <code style="word-break: break-all;">{{ new_invite_url }}</code>
+      <strong>New invite link</strong> — copy it now, it cannot be shown again:
+      <code style="word-break: break-all; display:block; margin-top:0.5rem;">{{ new_invite_url }}</code>
     </div>
   {% endif %}
 </div>
 
 <h2>Existing invites</h2>
-<table>
-  <thead>
-    <tr>
-      <th>Created</th>
-      <th>By</th>
-      <th>Status</th>
-      <th>Used by</th>
-      <th>Expires</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for inv in invites %}
-      <tr>
-        <td>{{ inv.created_at }}</td>
-        <td>{{ inv.creator_email or '—' }}</td>
-        <td>{{ inv.status_label }}</td>
-        <td>{{ inv.used_by_email or '—' }}</td>
-        <td>{{ inv.expires_at }}</td>
-      </tr>
-    {% endfor %}
-  </tbody>
-</table>
+{% if invites %}
+  <div class="table-wrap">
+    <table class="table-compact">
+      <thead>
+        <tr>
+          <th>Created</th>
+          <th>By</th>
+          <th>Note</th>
+          <th>Status</th>
+          <th>Uses</th>
+          <th>Used by</th>
+          <th>Expires</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for inv in invites %}
+          <tr>
+            <td title="{{ inv.created_at }}">{{ inv.created_at|timeago }}</td>
+            <td>{{ inv.creator_email or '—' }}</td>
+            <td>{{ inv.note or '—' }}</td>
+            <td>
+              {% if inv.is_active %}
+                <span class="badge badge-success">{{ inv.status_label }}</span>
+              {% elif inv.status_label == 'Revoked' %}
+                <span class="badge badge-danger">{{ inv.status_label }}</span>
+              {% else %}
+                <span class="badge badge-info">{{ inv.status_label }}</span>
+              {% endif %}
+            </td>
+            <td>{{ inv.used_count }} / {{ inv.max_uses }}</td>
+            <td>{{ inv.used_by_email or '—' }}</td>
+            <td title="{{ inv.expires_at }}">{{ inv.expires_at|timeago }}</td>
+            <td>
+              {% if inv.is_active %}
+                <form method="POST" action="/invites/{{ inv.id }}/revoke" style="display:inline;"
+                      data-confirm="Revoke this invite? Anyone holding the link will no longer be able to register.">
+                  <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+                  <button type="submit" class="btn btn-danger btn-small">Revoke</button>
+                </form>
+              {% else %}
+                <span class="meta">—</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <div class="empty-state">
+    <h2>No invites yet</h2>
+    <p>Generate one above to bring someone into the site.</p>
+  </div>
+{% endif %}
 {% endblock %}

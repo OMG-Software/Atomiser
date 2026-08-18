@@ -14,7 +14,6 @@ from urllib.parse import quote
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -28,10 +27,11 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
-from app.auth import require_user, CSRF_COOKIE, verify_csrf, get_current_user
+from app.auth import require_user, CSRF_COOKIE, verify_csrf, get_current_user, _audit
 from app.config import Config
 from app.db import get_db
-from app.roles import Role, require_role
+from app import jobs
+from app.roles import Role, has_role, require_role
 from app.utils import generate_token, hash_token, new_video_uuid, now_utc
 
 router = APIRouter(tags=["videos"])
@@ -75,6 +75,11 @@ def _readable_size(num_bytes: int) -> str:
             return f"{num_bytes:.1f} {unit}"
         num_bytes /= 1024
     return f"{num_bytes:.1f} TB"
+
+
+def _can_moderate(user) -> bool:
+    """True if the user holds Admin or above."""
+    return bool(user) and has_role(user["role"], Role.ADMIN)
 
 
 # ---------------------------------------------------------------------------
@@ -137,22 +142,12 @@ async def video_page(
 
     video = dict(video)
     is_owner = user["id"] == video["owner_id"]
-    is_admin = False
-    try:
-        require_role(user, Role.ADMIN)
-        is_admin = True
-    except Exception:
-        pass
+    is_admin = _can_moderate(user)
 
     if video["visibility"] == "private" and not (is_owner or is_admin):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Private video")
 
-    cursor = await db.execute(
-        "SELECT label, file_path, width, height, size_bytes, status FROM video_renditions WHERE video_id = ? ORDER BY height DESC",
-        (video["id"],),
-    )
-    renditions = [dict(r) for r in await cursor.fetchall()]
-    ready_renditions = [r for r in renditions if r["status"] == "ready"]
+    ready_renditions = await _ready_renditions(db, video["id"])
 
     return templates.TemplateResponse(
         "videos/player.html",
@@ -164,8 +159,98 @@ async def video_page(
             "site_title": await _site_title(db),
             "is_owner": is_owner,
             "is_admin": is_admin,
+            "progress": await _processing_progress(db, video["id"]),
         },
     )
+
+
+async def _ready_renditions(db, video_id: int) -> list:
+    """Ready renditions, best quality first, with a URL-safe filename.
+
+    The filename is derived here rather than in the template: file_path is an
+    OS-native path, so splitting on "/" in Jinja produces the whole path on
+    Windows and breaks every source URL.
+    """
+    cursor = await db.execute(
+        """
+        SELECT label, file_path, width, height, size_bytes, status
+        FROM video_renditions
+        WHERE video_id = ? AND status = 'ready'
+        ORDER BY height DESC
+        """,
+        (video_id,),
+    )
+    renditions = []
+    for row in await cursor.fetchall():
+        rendition = dict(row)
+        rendition["filename"] = Path(rendition["file_path"]).name
+        renditions.append(rendition)
+    return renditions
+
+
+async def _processing_progress(db, video_id: int) -> dict:
+    """Rendition counts and the last error, for the processing panel."""
+    cursor = await db.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS ready,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+        FROM video_renditions WHERE video_id = ?
+        """,
+        (video_id,),
+    )
+    row = await cursor.fetchone()
+    total = row["total"] or 0
+    ready = row["ready"] or 0
+
+    cursor = await db.execute(
+        "SELECT status, attempts, last_error FROM transcode_jobs WHERE video_id = ? ORDER BY id DESC LIMIT 1",
+        (video_id,),
+    )
+    job = await cursor.fetchone()
+
+    return {
+        "total": total,
+        "ready": ready,
+        "failed": row["failed"] or 0,
+        # Before the rendition rows exist there is nothing to measure, so the
+        # template shows an indeterminate state rather than a misleading 0%.
+        "percent": int(ready * 100 / total) if total else 0,
+        "job_status": job["status"] if job else None,
+        "attempts": job["attempts"] if job else 0,
+        "last_error": job["last_error"] if job else None,
+    }
+
+
+@router.get("/videos/{video_uuid}/status")
+async def video_status(
+    video_uuid: str,
+    request: Request,
+    user=Depends(require_user),
+    db=Depends(get_db),
+):
+    """JSON status for the player page to poll while a video is transcoding."""
+    cursor = await db.execute(
+        "SELECT id, owner_id, visibility, status FROM videos WHERE uuid = ?",
+        (video_uuid,),
+    )
+    video = await cursor.fetchone()
+    if not video:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+
+    is_owner = user["id"] == video["owner_id"]
+    if video["visibility"] == "private" and not (is_owner or _can_moderate(user)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Private video")
+
+    progress = await _processing_progress(db, video["id"])
+    return JSONResponse({
+        "status": video["status"],
+        "ready": video["status"] == "ready",
+        "renditions_ready": progress["ready"],
+        "renditions_total": progress["total"],
+        "percent": progress["percent"],
+    })
 
 
 @router.post("/videos/{video_uuid}/edit")
@@ -174,6 +259,7 @@ async def edit_video(
     request: Request,
     title: str = Form(...),
     description: str = Form(""),
+    visibility: str = Form(None),
     user=Depends(require_user),
     db=Depends(get_db),
 ):
@@ -196,22 +282,127 @@ async def edit_video(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
 
     is_owner = user["id"] == video["owner_id"]
-    is_admin = False
-    try:
-        require_role(user, Role.ADMIN)
-        is_admin = True
-    except Exception:
-        pass
+    is_admin = _can_moderate(user)
 
     if not (is_owner or is_admin):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot edit this video")
 
+    # Visibility is optional so older clients (and the tests) can post just the
+    # title and description without silently flipping a private video public.
+    new_visibility = video["visibility"]
+    if visibility is not None:
+        if visibility not in ("site", "private"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid visibility")
+        new_visibility = visibility
+
     await db.execute(
-        "UPDATE videos SET title = ?, description = ? WHERE id = ?",
-        (title, description, video["id"]),
+        "UPDATE videos SET title = ?, description = ?, visibility = ? WHERE id = ?",
+        (title, description, new_visibility, video["id"]),
     )
     await db.commit()
+    if new_visibility != video["visibility"]:
+        await _audit(
+            db, user["id"], "video_visibility_changed",
+            target_type="video", target_id=video_uuid, request=request,
+        )
+        # A video published after the fact still deserves its announcement.
+        # queue_new_video_notifications() is a no-op unless it is now ready,
+        # site-visible, and has never been announced.
+        if new_visibility == "site":
+            from app import notifications
+
+            try:
+                await notifications.queue_new_video_notifications(db, video["id"])
+            except Exception:  # noqa: BLE001 - the edit itself succeeded
+                logger.exception("Could not queue notifications for video %s", video_uuid)
     return RedirectResponse(url=f"/videos/{video_uuid}?success=1", status_code=303)
+
+
+@router.post("/videos/{video_uuid}/delete")
+async def delete_own_video(
+    video_uuid: str,
+    request: Request,
+    user=Depends(require_user),
+    db=Depends(get_db),
+):
+    """Delete a video you own (admins may delete any, subject to the same
+    Configurator protection the admin panel applies)."""
+    csrf_cookie = request.cookies.get(CSRF_COOKIE)
+    form = await request.form()
+    if not verify_csrf(form.get("csrf", ""), csrf_cookie):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
+
+    cursor = await db.execute(
+        "SELECT id, uuid, owner_id, raw_path, thumbnail_path FROM videos WHERE uuid = ?",
+        (video_uuid,),
+    )
+    video = await cursor.fetchone()
+    if not video:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+
+    is_owner = user["id"] == video["owner_id"]
+    if not (is_owner or _can_moderate(user)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot delete this video")
+
+    if not is_owner:
+        # An admin may not delete a Configurator's video; only a Configurator may.
+        cursor = await db.execute("SELECT role FROM users WHERE id = ?", (video["owner_id"],))
+        owner = await cursor.fetchone()
+        if owner and owner["role"] == Role.CONFIGURATOR.value:
+            require_role(user, Role.CONFIGURATOR)
+
+    await purge_video_files(db, dict(video))
+    await db.execute("DELETE FROM videos WHERE id = ?", (video["id"],))
+    await db.commit()
+    await _audit(db, user["id"], "video_deleted", target_type="video", target_id=video_uuid, request=request)
+
+    return RedirectResponse(url="/profile" if is_owner else "/admin/videos", status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# File cleanup
+# ---------------------------------------------------------------------------
+
+async def purge_video_files(db, video: dict) -> None:
+    """Remove every file belonging to a video: raw upload, renditions, thumbnail.
+
+    Deleting the row alone used to leave all of it on disk, so a deleted 500 MB
+    upload still occupied roughly a gigabyte forever.
+    """
+    paths = []
+    if video.get("raw_path"):
+        paths.append(Path(video["raw_path"]))
+    if video.get("thumbnail_path"):
+        paths.append(Path(video["thumbnail_path"]))
+
+    cursor = await db.execute(
+        "SELECT file_path FROM video_renditions WHERE video_id = ?", (video["id"],)
+    )
+    paths.extend(Path(r["file_path"]) for r in await cursor.fetchall())
+
+    await run_in_threadpool(_unlink_all, paths)
+    # The per-video rendition directory is ours, so remove it once emptied.
+    await run_in_threadpool(_remove_video_dir, video.get("uuid"))
+
+
+def _unlink_all(paths) -> None:
+    for path in paths:
+        try:
+            if path and _is_within_upload_dir(path):
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not delete %s: %s", path, exc)
+
+
+def _remove_video_dir(video_uuid) -> None:
+    if not video_uuid:
+        return
+    out_dir = _videos_dir() / video_uuid
+    try:
+        if out_dir.is_dir() and _is_within_upload_dir(out_dir):
+            shutil.rmtree(out_dir, ignore_errors=True)
+    except OSError as exc:
+        logger.warning("Could not remove %s: %s", out_dir, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +420,6 @@ async def upload_page(request: Request, user=Depends(require_user), db=Depends(g
 @router.post("/upload")
 async def upload_video(
     request: Request,
-    background_tasks: BackgroundTasks,
     title: str = Form(...),
     description: str = Form(""),
     visibility: str = Form("site"),
@@ -287,16 +477,17 @@ async def upload_video(
 
     cursor = await db.execute(
         """
-        INSERT INTO videos (uuid, owner_id, title, description, visibility, status, raw_path)
-        VALUES (?, ?, ?, ?, ?, 'uploading', ?)
+        INSERT INTO videos (uuid, owner_id, title, description, visibility, status, raw_path, raw_size_bytes)
+        VALUES (?, ?, ?, ?, ?, 'uploading', ?, ?)
         """,
-        (video_uuid, user["id"], title.strip(), description.strip(), visibility, str(raw_path)),
+        (video_uuid, user["id"], title.strip(), description.strip(), visibility, str(raw_path), size),
     )
     await db.commit()
     video_id = cursor.lastrowid
 
-    # Kick off transcoding in the background.
-    background_tasks.add_task(transcode_video, video_id, str(raw_path), video_uuid)
+    # Queue transcoding. A job row outlives this process, so a restart between
+    # here and the transcode finishing no longer strands the video.
+    await jobs.enqueue(db, video_id)
 
     return RedirectResponse(url=f"/videos/{video_uuid}", status_code=303)
 
@@ -457,7 +648,6 @@ async def upload_chunk(
 @router.post("/upload/complete")
 async def upload_complete(
     request: Request,
-    background_tasks: BackgroundTasks,
     upload_id: str = Form(...),
     csrf: str = Form(...),
     user=Depends(require_user),
@@ -508,8 +698,8 @@ async def upload_complete(
 
     cursor = await db.execute(
         """
-        INSERT INTO videos (uuid, owner_id, title, description, visibility, status, raw_path)
-        VALUES (?, ?, ?, ?, ?, 'uploading', ?)
+        INSERT INTO videos (uuid, owner_id, title, description, visibility, status, raw_path, raw_size_bytes)
+        VALUES (?, ?, ?, ?, ?, 'uploading', ?, ?)
         """,
         (
             video_uuid,
@@ -518,12 +708,13 @@ async def upload_complete(
             (meta.get("description") or "").strip(),
             meta.get("visibility", "site"),
             str(raw_path),
+            size,
         ),
     )
     await db.commit()
     video_id = cursor.lastrowid
 
-    background_tasks.add_task(transcode_video, video_id, str(raw_path), video_uuid)
+    await jobs.enqueue(db, video_id)
 
     return JSONResponse({"uuid": video_uuid})
 
@@ -551,12 +742,7 @@ async def stream_video(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not ready")
 
     is_owner = user["id"] == video["owner_id"]
-    is_admin = False
-    try:
-        require_role(user, Role.ADMIN)
-        is_admin = True
-    except Exception:
-        pass
+    is_admin = _can_moderate(user)
 
     if video["visibility"] == "private" and not (is_owner or is_admin):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Private video")
@@ -604,12 +790,7 @@ async def thumbnail(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thumbnail not found")
 
     is_owner = user["id"] == video["owner_id"]
-    is_admin = False
-    try:
-        require_role(user, Role.ADMIN)
-        is_admin = True
-    except Exception:
-        pass
+    is_admin = _can_moderate(user)
 
     if video["visibility"] == "private" and not (is_owner or is_admin):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Private video")
@@ -660,7 +841,14 @@ async def transcode_video(video_id: int, raw_path: str, video_uuid: str):
         raw = Path(raw_path)
         if not raw.exists():
             await _update_video_status_db(db, video_id, "failed")
+            await db.commit()
             return
+
+        # Tell the player page that real work has started. Without this the
+        # schema's 'processing' state was never written and the viewer sat on
+        # an empty player with no explanation.
+        await _update_video_status_db(db, video_id, "processing")
+        await db.commit()
 
         duration = await _probe_duration(raw)
         if duration is None:
@@ -719,10 +907,32 @@ async def transcode_video(video_id: int, raw_path: str, video_uuid: str):
             (video_id,),
         )
         row = await cursor.fetchone()
+        succeeded = row["c"] > 0
         await _update_video_status_db(
-            db, video_id, "ready" if row["c"] > 0 else "failed", duration
+            db, video_id, "ready" if succeeded else "failed", duration
         )
         await db.commit()
+
+        if succeeded:
+            await _purge_raw_original(db, video_id, raw)
+
+
+async def _purge_raw_original(db, video_id: int, raw: Path) -> None:
+    """Delete the original upload once renditions exist.
+
+    The raw file is roughly the size of all renditions combined and is never
+    served, so keeping it doubles storage per video for no benefit. Set
+    KEEP_RAW_UPLOADS=true to retain it.
+    """
+    if Config.KEEP_RAW_UPLOADS:
+        return
+    try:
+        if raw.exists() and _is_within_upload_dir(raw):
+            await run_in_threadpool(raw.unlink, True)
+            await db.execute("UPDATE videos SET raw_path = NULL WHERE id = ?", (video_id,))
+            await db.commit()
+    except OSError as exc:
+        logger.warning("Could not purge raw upload %s: %s", raw, exc)
 
 
 async def _probe_duration(path: Path) -> Optional[int]:

@@ -487,6 +487,29 @@ label:first-child { margin-top: 0; }
 .inline-form { display: inline-flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
 .inline-form input, .inline-form select, .inline-form textarea { width: auto; margin-bottom: 0; }
 
+/* A checkbox and its wording on one line. The bare `label` rule above is
+   block-level with top margin, which stacks a checkbox above its own text. */
+.checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  margin: 0.5rem 0 0;
+  color: var(--text);
+  font-size: 0.94rem;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+.checkbox-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin: 0.15rem 0 0;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 /* ----------------------------------------------------------------------------
  * Alerts, badges, chips
  * ------------------------------------------------------------------------- */
@@ -652,10 +675,137 @@ hr { border: none; border-top: 1px solid var(--border); margin: 1.4rem 0; }
   color: var(--danger);
 }
 
+.upload-progress-bar.indeterminate {
+  width: 35% !important;
+  animation: indeterminate-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes indeterminate-slide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(320%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .upload-progress-bar.indeterminate { animation: none; width: 100% !important; opacity: 0.4; }
+}
+
+/* ----------------------------------------------------------------------------
+ * Player: quality selector and processing state
+ * ------------------------------------------------------------------------- */
+.player-quality {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+}
+.player-quality label { margin: 0; white-space: nowrap; }
+.player-quality select { width: auto; min-width: 150px; padding: 0.4rem 2.2rem 0.4rem 0.7rem; font-size: 0.86rem; }
+.player-quality .meta { font-size: 0.82rem; color: var(--success); }
+
+.processing-panel {
+  display: flex;
+  gap: 1.5rem;
+  align-items: center;
+  padding: 1.75rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, var(--surface) 0%, var(--bg-soft) 140%);
+  box-shadow: var(--shadow-sm);
+  flex-wrap: wrap;
+}
+.processing-poster {
+  width: 240px;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  filter: saturate(0.5) brightness(0.7);
+}
+.processing-body { flex: 1 1 280px; min-width: 0; }
+.processing-body h2 { margin: 0 0 0.4rem; }
+
+/* ----------------------------------------------------------------------------
+ * Stat tiles (admin dashboard)
+ * ------------------------------------------------------------------------- */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.75rem;
+}
+.stat-tile {
+  padding: 1.1rem 1.25rem;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.stat-tile .stat-value {
+  font-size: 1.75rem;
+  font-weight: 750;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.stat-tile .stat-label {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.stat-tile a { font-size: 0.85rem; margin-top: 0.35rem; }
+
+/* Filter bars above admin tables */
+.filter-bar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+.filter-bar label { margin: 0 0 0.3rem; }
+.filter-bar .field { display: flex; flex-direction: column; }
+.filter-bar input, .filter-bar select { width: auto; min-width: 160px; }
+
+/* Compact table variant for dense admin lists */
+.table-compact th, .table-compact td { padding: 0.55rem 0.8rem; font-size: 0.88rem; }
+.table-compact code { font-size: 0.82em; }
+
+.table-wrap { width: 100%; overflow-x: auto; }
+
+.pager {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin-top: 1.25rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.session-row {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.8rem 0;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.session-row:last-child { border-bottom: none; }
+.session-row .session-detail { flex: 1 1 260px; min-width: 0; }
+.session-row .session-detail strong { font-weight: 650; }
+.session-row .session-detail .meta { font-size: 0.82rem; word-break: break-word; }
+
 /* ----------------------------------------------------------------------------
  * Responsive
  * ------------------------------------------------------------------------- */
 @media (max-width: 760px) {
+  .processing-panel { padding: 1.25rem; gap: 1rem; }
+  .processing-poster { width: 100%; }
+  .filter-bar { gap: 0.5rem; }
+  .filter-bar input, .filter-bar select { min-width: 120px; }
+
   .navbar { flex-wrap: wrap; padding: 0.6rem 1rem; }
   .nav-links { gap: 0.15rem; margin-left: 0; width: 100%; }
   .container { padding: 1.25rem 1rem 2.5rem; }

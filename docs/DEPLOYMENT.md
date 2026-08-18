@@ -13,13 +13,16 @@ The example domain used below is `example.com`. Replace it with your own domain 
 - `ffmpeg` and `ffprobe` installed.
 - `nginx`.
 - `certbot` and the nginx plugin.
+- The `sqlite3` command-line tool, used by the backup, upgrade and
+  troubleshooting steps below. The Python bindings are built in, but the CLI is
+  a separate package and a minimal server may not have it.
 - A domain name pointed at your server.
 
 Install the base dependencies with `dnf`:
 
 ```bash
 sudo dnf update -y
-sudo dnf install -y python3 python3-pip python3-venv ffmpeg nginx
+sudo dnf install -y python3 python3-pip python3-venv ffmpeg nginx sqlite
 sudo dnf install -y certbot python3-certbot-nginx
 ```
 
@@ -118,12 +121,154 @@ MAX_UPLOAD_MB=500
 # Must match your public domain, or passkeys will not work.
 WEBAUTHN_RP_ID=example.com
 
+# Required as soon as SMTP is enabled: every emailed link is built from this.
+SITE_URL=https://example.com
+
 # Not used in production because nginx talks to the unix socket, but keep sensible defaults.
 HOST=127.0.0.1
 PORT=8000
 ```
 
 `SECRET_KEY`, `WEBAUTHN_RP_ID`, and the database/upload paths are the most important changes from the development defaults.
+
+### Transcoding
+
+Transcoding runs as a durable job queue rather than an in-process background
+task, so a restart mid-transcode resumes on the next start instead of stranding
+the video. Relevant settings:
+
+```ini
+# Videos transcoded at once. 1 keeps ffmpeg from starving the web worker.
+TRANSCODE_CONCURRENCY=1
+
+# Retries before a video is marked failed for good.
+TRANSCODE_MAX_ATTEMPTS=3
+
+# Delete the original upload once a rendition succeeds. The original is roughly
+# as large as all renditions combined and is never served, so keeping it about
+# doubles storage per video.
+KEEP_RAW_UPLOADS=false
+```
+
+On a busy site you can move transcoding off the web service entirely: set
+`RUN_TRANSCODE_WORKER=false` in the web service's environment and run a second
+unit with it set to `true` that imports `app.jobs` and calls `start_workers()`.
+Both processes share the same SQLite database, and the conditional-UPDATE job
+claim means two workers never take the same job.
+
+Overlapping processes are safe. A claimed job carries a lease
+(`TRANSCODE_LEASE_SECONDS`, default 120) that its worker renews every third of
+that period while ffmpeg runs, and startup recovery reclaims only jobs whose
+lease has lapsed. So a rolling restart, or a worker unit running alongside the
+web app, cannot hand the same video to two ffmpeg processes. Raise the lease if
+a worker can be paused long enough — heavy swapping, a suspended VM — to miss
+several renewals; the only cost of a longer lease is a slower pickup after a
+genuine crash. The email queue uses the same scheme via `EMAIL_LEASE_SECONDS`.
+
+> **Note:** with `KEEP_RAW_UPLOADS=false` a failed transcode can only be retried
+> while the original is still on disk — which it is, because the original is
+> deleted only after a rendition succeeds. Once a video is `ready` there is
+> nothing to reprocess, and the admin retry button reports that.
+
+### Rate limiting
+
+The nginx `limit_req` zones remain the first line of defence, but the app now
+also throttles the auth endpoints itself, so protection survives a proxy
+misconfiguration or a move to a different front end:
+
+```ini
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_WINDOW_SECONDS=900
+LOGIN_MAX_FAILURES_PER_EMAIL=8
+LOGIN_MAX_FAILURES_PER_IP=25
+LOCKOUT_MINUTES=15
+```
+
+The IP threshold is deliberately much higher than the email one, because a
+household or office behind one NAT address shares it.
+
+> **Important:** the IP-keyed limit is only meaningful if the app sees the real
+> client address. nginx must forward `X-Forwarded-For`/`X-Real-IP` (the shipped
+> config does), otherwise every request looks like it comes from one address.
+
+### Email (optional)
+
+Leave `SMTP_HOST` blank to run with no mail at all — invites are copy-paste
+links and passwords are reset by an admin, exactly as before. Setting both
+`SMTP_HOST` and `SMTP_FROM` additionally enables emailed invites and
+self-service password reset:
+
+```ini
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=atomiser@example.com
+SMTP_PASSWORD=<app-password>
+SMTP_FROM=Atomiser <atomiser@example.com>
+SMTP_STARTTLS=true
+SMTP_SSL=false
+PASSWORD_RESET_TTL_MINUTES=60
+```
+
+Use port 465 with `SMTP_SSL=true` and `SMTP_STARTTLS=false` for implicit TLS.
+
+> **`SITE_URL` is required once SMTP is on.** Every link that goes into an email
+> is built from it. The only other source of a hostname is the request's `Host`
+> header, which the client controls and the shipped nginx config forwards
+> verbatim — a password reset link built that way is a host-header injection:
+> an attacker requests a reset for someone else with `Host: evil.test`, and the
+> victim is emailed a genuine token pointing at the attacker's domain. With SMTP
+> enabled and `SITE_URL` unset, password recovery is refused, invites cannot be
+> emailed, notifications are skipped, and the admin dashboard shows a warning.
+
+Send yourself a test invite from `/invites/` after enabling this; delivery
+failures are logged to the journal and never lose the invite, since the link is
+still shown on screen.
+
+> **Password reset emails go through the queue worker.** `/auth/forgot` writes
+> the message to `email_queue` and returns immediately rather than waiting on
+> SMTP — an inline send makes the response measurably slower for a registered
+> address than an unknown one, which is enough to enumerate accounts. The
+> practical consequence is that `RUN_EMAIL_WORKER=false` with no separate worker
+> process means reset emails are written but never delivered. Leave the worker
+> enabled somewhere. Transactional mail is sent ahead of bulk notifications, so
+> a large fan-out cannot delay a reset link.
+
+### New-video notifications
+
+With SMTP configured, members are emailed whenever a video finishes processing
+and is visible to the site. They are subscribed by default and can opt out from
+their profile or from the unsubscribe link in any notification.
+
+```ini
+NOTIFY_NEW_VIDEOS=true
+EMAIL_BATCH_SIZE=20
+EMAIL_POLL_SECONDS=10
+EMAIL_MAX_ATTEMPTS=3
+EMAIL_RETRY_MINUTES=5
+EMAIL_RETENTION_DAYS=30
+```
+
+> **`SITE_URL` is required for this feature, not optional.** The sending worker
+> runs outside any HTTP request, so there is no `Host` header to fall back on.
+> With it unset, notifications are skipped rather than sent with broken links,
+> an error is logged, and the admin dashboard shows a warning.
+
+Messages go through the `email_queue` table rather than being sent inline, so a
+fan-out to a large membership never blocks a transcode, a failed send retries
+with an exponential backoff, and a restart mid-send resumes on the next start.
+`EMAIL_BATCH_SIZE` bounds how many messages go out per pass over one SMTP
+connection — lower it if your provider rate-limits you.
+
+The admin dashboard reports subscriber count and queued/sent/failed totals, and
+lists undeliverable messages with the SMTP error. To inspect the queue directly:
+
+```bash
+sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db     "SELECT id, to_address, status, attempts, last_error FROM email_queue ORDER BY id DESC LIMIT 20;"
+```
+
+Like transcoding, the email worker can run in its own process: set
+`RUN_EMAIL_WORKER=false` on the web service and `true` on a second unit. The
+conditional-UPDATE claim means two workers never send the same message twice.
 
 ---
 
@@ -298,6 +443,112 @@ sudo systemctl restart atomiser
 
 Always back up the database before a major update (see Backups below). `init_db()` applies any new migration scripts from `db/migrations/` on the restart.
 
+That is the routine case. Upgrading an existing site **across a feature release**
+needs a few decisions first — see the next section.
+
+### Upgrading an existing site
+
+The schema upgrade itself is automatic and non-destructive: `init_db()` applies
+every migration on startup, all of them idempotent, so a restart (or three)
+changes nothing beyond adding the new tables and columns. Existing rows are
+preserved exactly, including password hashes, TOTP secrets and passkey
+credentials. Nobody is signed out and no invite is invalidated.
+
+What does need attention is the handful of settings that change *behaviour*, and
+one surprise involving email.
+
+#### 1. Back up, with the service stopped
+
+```bash
+sudo systemctl stop atomiser
+sudo tar czf /root/atomiser-backup-$(date +%F).tar.gz     /opt/atomiser/data /opt/atomiser/uploads /etc/atomiser/atomiser.env
+```
+
+Stopping first matters: the database runs in WAL mode, so copying it hot can
+capture a torn state. This archive is the only rollback path for the media
+files, so do not skip it.
+
+#### 2. Decide three settings before the first start
+
+Edit `/etc/atomiser/atomiser.env` while the service is still stopped.
+
+| Setting | Why it matters when upgrading |
+|---|---|
+| `KEEP_RAW_UPLOADS` | Defaults to `false`. Originals already on disk are left alone, but every *future* transcode deletes its original once a rendition succeeds. Set `true` to keep them. Once an original is purged the admin "retry" button cannot reprocess that video — there is nothing left to encode from. |
+| `SITE_URL` | **Required** as soon as `SMTP_HOST` is set. If you already run SMTP without it, password recovery is refused after the upgrade until you set it. See the Email section above for why the request's `Host` header is not an acceptable substitute. |
+| `NOTIFY_NEW_VIDEOS` | Set `false` for the first boot only. See step 4. |
+
+#### 3. Deploy and start
+
+Follow *Update the application* above, then watch the journal as it comes up:
+
+```bash
+sudo journalctl -u atomiser -f
+```
+
+You should see the migrations apply, then `Started N transcode worker(s)` and
+`Started email queue worker`.
+
+#### 4. Drain the transcode backlog before enabling notifications
+
+Older versions ran transcoding as an in-process background task, which was lost
+whenever the service restarted. An upgraded install therefore usually has
+several videos stranded in `uploading`. Startup recovery finds them and
+transcodes them properly — which is the point — but a completed transcode also
+**emails every member**, so without care the upgrade announces a batch of
+weeks-old uploads.
+
+With `NOTIFY_NEW_VIDEOS=false` from step 2, let the backlog finish (the admin
+dashboard shows the queue draining), then mark everything as already announced:
+
+```bash
+sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db     "UPDATE videos SET notified_at = CURRENT_TIMESTAMP WHERE notified_at IS NULL;"
+```
+
+Then set `NOTIFY_NEW_VIDEOS=true` and restart. This also prevents an old
+*private* video from announcing itself later if someone makes it public.
+
+Note that every existing member is subscribed by default — notifications are
+opt-out. They can turn them off from their profile or via the unsubscribe link
+in any message.
+
+#### 5. Optional: backfill storage figures
+
+`videos.raw_size_bytes` is recorded at upload, so it is empty for videos that
+predate the upgrade and the dashboard's storage total under-reports them.
+Nothing is broken; the number is just low. To correct it from what is on disk:
+
+```bash
+sudo -u atomiser /opt/atomiser/venv/bin/python - <<'PY'
+import os, sqlite3
+db = sqlite3.connect("/opt/atomiser/data/atomiser.db")
+rows = db.execute(
+    "SELECT id, raw_path FROM videos WHERE raw_path IS NOT NULL AND raw_size_bytes IS NULL"
+).fetchall()
+updated = 0
+for video_id, path in rows:
+    # An original that has already been purged has no size to record; skip it.
+    if os.path.exists(path):
+        db.execute("UPDATE videos SET raw_size_bytes = ? WHERE id = ?",
+                   (os.path.getsize(path), video_id))
+        updated += 1
+db.commit()
+print(f"backfilled {updated} of {len(rows)} candidate video(s)")
+PY
+```
+
+#### 6. Rolling back
+
+Every added column is nullable or has a default, and the new tables are simply
+ignored by older code, so the upgraded database stays readable and writable by
+the previous release. Rolling back is just redeploying the old zip — no database
+surgery, and no need to restore the backup unless the files themselves are
+damaged.
+
+The one caveat: anything sitting in `transcode_jobs` or `email_queue` will not
+be processed while the old code is running. It resumes if you roll forward
+again.
+
 ### Update the operating system
 
 ```bash
@@ -307,11 +558,17 @@ sudo systemctl restart atomiser
 
 ### Database migrations
 
-`init_db()` in `app/db.py` runs all migration scripts from `db/migrations/` on every startup, so a normal service restart applies new schema changes. Back up the database before major updates:
+`init_db()` in `app/db.py` runs all migration scripts from `db/migrations/` on every startup, so a normal service restart applies new schema changes. Migrations are idempotent — re-running them is safe.
+
+Back up the database before major updates. The database runs in WAL mode, so use
+SQLite's own backup command rather than `cp`, which can capture a torn state
+while the service is writing:
 
 ```bash
-sudo -u atomiser cp /opt/atomiser/data/atomiser.db /opt/atomiser/data/atomiser.db.bak.$(date +%F)
+sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db     ".backup '/opt/atomiser/data/atomiser.db.bak.$(date +%F)'"
 ```
+
+A plain `cp` is only safe with the service stopped.
 
 ### Backups
 
@@ -406,9 +663,72 @@ sudo setsebool -P httpd_read_user_content 1
   sudo -u atomiser ffprobe -version
   ```
 - Check disk space in `/opt/atomiser/uploads`.
-- Review the journal for Python exceptions from `app/videos.py`.
+- Review the journal for Python exceptions from `app/videos.py` or `app/jobs.py`.
 - Ensure the `atomiser` user has write permission to `/opt/atomiser/uploads/raw` and `/opt/atomiser/uploads/videos`.
 - Check SELinux denials if files cannot be written.
+- Check the queue. **Admin → dashboard** shows how many jobs are queued and lists
+  failed transcodes with the ffmpeg error and a retry button. From the shell:
+  ```bash
+  sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db \
+      "SELECT id, video_id, status, attempts, last_error FROM transcode_jobs ORDER BY id DESC LIMIT 20;"
+  ```
+- Confirm the worker started. The journal logs `Started N transcode worker(s)` at
+  boot; if it is missing, check `RUN_TRANSCODE_WORKER` is not set to false.
+
+### A video is stuck on "Processing"
+
+Jobs survive a restart, so this is almost always a real ffmpeg failure rather
+than a lost task. Check the failed-transcode list on the admin dashboard for the
+error, then retry it from there. A job left `running` by a hard kill is requeued
+automatically the next time the service starts.
+
+### Password reset emails are not arriving
+
+Resets are queued and delivered by the email worker, not sent during the
+request, so check the queue rather than assuming SMTP is broken:
+
+```bash
+sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db \
+    "SELECT id, to_address, status, attempts, last_error FROM email_queue WHERE kind = 'password_reset' ORDER BY id DESC LIMIT 10;"
+```
+
+- Rows stuck at `queued` with `attempts = 0` mean no worker is running. Check
+  `RUN_EMAIL_WORKER` and look for `Started email queue worker` in the journal.
+- Rows at `queued` with rising `attempts` mean the SMTP server is rejecting
+  them; `last_error` carries the reason.
+- No row at all means the request was refused before a token was minted — most
+  often `SITE_URL` unset, which is logged as an error and shown on the admin
+  dashboard.
+
+### Notification emails are not arriving
+
+- Check the admin dashboard first: it shows whether SMTP is detected, how many
+  messages are queued, and any undeliverable ones with the SMTP error.
+- A **`SITE_URL` is not set** banner there means notifications are being skipped
+  entirely. Set it in the environment file and restart.
+- Confirm the recipient is actually subscribed. An unsubscribe is per-user:
+  ```bash
+  sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db       "SELECT email, notify_new_videos FROM users;"
+  ```
+- Messages stuck at `queued` with rising `attempts` mean the SMTP server is
+  rejecting them; `last_error` carries the reason. Messages that never leave
+  `queued` with `attempts = 0` mean the worker is not running — check the
+  journal for `Started email queue worker` and `RUN_EMAIL_WORKER`.
+- Remember the uploader is deliberately never notified about their own video.
+
+### A user is locked out
+
+Repeated failed sign-ins lock an account for `LOCKOUT_MINUTES`. The lock expires
+on its own; to clear it immediately, have the user complete a password reset
+(which clears it), or clear it directly:
+
+```bash
+sudo -u atomiser sqlite3 /opt/atomiser/data/atomiser.db \
+    "UPDATE users SET locked_until = NULL WHERE email = 'someone@example.com';"
+```
+
+**Admin → audit log**, filtered to `login_failed` and `login_throttled`, shows
+what triggered it and from which addresses.
 
 ### `ModuleNotFoundError: No module named 'app'` on startup
 

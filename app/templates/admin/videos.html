@@ -1,37 +1,80 @@
 {% extends "base.html" %}
 {% block title %}Videos — {{ site_title|default('Atomiser Site') }}{% endblock %}
 {% block content %}
-<h1>Videos</h1>
+<div class="section-head">
+  <h1>Videos</h1>
+  <div class="meta">{{ videos|length }} shown</div>
+</div>
 
-<table>
-  <thead>
-    <tr>
-      <th>UUID</th>
-      <th>Title</th>
-      <th>Owner</th>
-      <th>Visibility</th>
-      <th>Status</th>
-      <th>Uploaded</th>
-      <th>Actions</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for v in videos %}
-      <tr>
-        <td><code>{{ v.uuid[:8] }}</code></td>
-        <td><a href="/videos/{{ v.uuid }}">{{ v.title }}</a></td>
-        <td>{{ v.owner_email }}</td>
-        <td>{{ v.visibility }}</td>
-        <td>{{ v.status }}</td>
-        <td>{{ v.created_at }}</td>
-        <td>
-          <form method="POST" action="/admin/videos/{{ v.uuid }}/delete" style="display:inline;" onsubmit="return confirm('Delete this video?')">
-            <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
-            <button type="submit" class="btn btn-danger">Delete</button>
-          </form>
-        </td>
-      </tr>
-    {% endfor %}
-  </tbody>
-</table>
+<form method="GET" action="/admin/videos" class="filter-bar">
+  <div class="field">
+    <label for="status">Status</label>
+    <select id="status" name="status">
+      <option value="">All</option>
+      {% for s in ['ready', 'processing', 'uploading', 'failed'] %}
+        <option value="{{ s }}" {% if status_filter == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <button type="submit" class="btn btn-small">Filter</button>
+  {% if status_filter %}<a class="btn btn-secondary btn-small" href="/admin/videos">Reset</a>{% endif %}
+</form>
+
+{% if videos %}
+  <div class="table-wrap">
+    <table class="table-compact">
+      <thead>
+        <tr>
+          <th>UUID</th>
+          <th>Title</th>
+          <th>Owner</th>
+          <th>Visibility</th>
+          <th>Status</th>
+          <th>Size</th>
+          <th>Uploaded</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for v in videos %}
+          <tr>
+            <td><code>{{ v.uuid[:8] }}</code></td>
+            <td><a href="/videos/{{ v.uuid }}">{{ v.title }}</a></td>
+            <td>{{ v.owner_email }}</td>
+            <td>{{ v.visibility }}</td>
+            <td>
+              {% if v.status == 'ready' %}
+                <span class="badge badge-success">ready</span>
+              {% elif v.status == 'failed' %}
+                <span class="badge badge-danger" title="{{ v.job_error or '' }}">failed</span>
+              {% else %}
+                <span class="badge badge-info">{{ v.status }}</span>
+              {% endif %}
+            </td>
+            <td>{{ (v.total_bytes or 0)|filesizeformat(true) }}</td>
+            <td title="{{ v.created_at }}">{{ v.created_at|timeago }}</td>
+            <td>
+              {% if v.status == 'failed' %}
+                <form method="POST" action="/admin/videos/{{ v.uuid }}/retry" style="display:inline;">
+                  <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+                  <button type="submit" class="btn btn-secondary btn-small">Retry</button>
+                </form>
+              {% endif %}
+              <form method="POST" action="/admin/videos/{{ v.uuid }}/delete" style="display:inline;"
+                    data-confirm="Delete this video permanently? The original, every quality version and the thumbnail will be removed.">
+                <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+                <button type="submit" class="btn btn-danger btn-small">Delete</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <div class="empty-state">
+    <h2>No videos</h2>
+    <p>Nothing matches this filter.</p>
+  </div>
+{% endif %}
 {% endblock %}

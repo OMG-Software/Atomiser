@@ -1,30 +1,200 @@
 {% extends "base.html" %}
 {% block title %}Admin — {{ site_title|default('Atomiser Site') }}{% endblock %}
 {% block content %}
-<h1>Admin dashboard</h1>
+<div class="section-head">
+  <h1>Admin dashboard</h1>
+  <div class="meta">
+    <a href="/admin/users">Users</a> ·
+    <a href="/admin/videos">Videos</a> ·
+    <a href="/invites">Invites</a> ·
+    <a href="/admin/audit">Audit log</a>
+    {% if user.role == 'configurator' %} · <a href="/admin/settings">Settings</a>{% endif %}
+  </div>
+</div>
 
-<div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));">
-  <div class="card">
-    <strong>{{ stats.users }}</strong>
-    <div class="meta">Users</div>
+<div class="stat-grid">
+  <div class="card stat-tile">
+    <span class="stat-value">{{ stats.users }}</span>
+    <span class="stat-label">Users</span>
     <a href="/admin/users">Manage →</a>
   </div>
-  <div class="card">
-    <strong>{{ stats.videos }}</strong>
-    <div class="meta">Videos</div>
+  <div class="card stat-tile">
+    <span class="stat-value">{{ stats.videos }}</span>
+    <span class="stat-label">Videos</span>
     <a href="/admin/videos">Manage →</a>
   </div>
-  <div class="card">
-    <strong>{{ stats.active_invites }}</strong>
-    <div class="meta">Active invites</div>
+  <div class="card stat-tile">
+    <span class="stat-value">{{ stats.storage_bytes|filesizeformat(true) }}</span>
+    <span class="stat-label">Storage used</span>
+    <span class="meta" style="font-size:0.8rem;">Originals + renditions</span>
+  </div>
+  <div class="card stat-tile">
+    <span class="stat-value">{{ stats.active_invites }}</span>
+    <span class="stat-label">Active invites</span>
     <a href="/invites">Invites →</a>
   </div>
-  {% if user.role == 'configurator' %}
-    <div class="card">
-      <strong>⚙</strong>
-      <div class="meta">Site settings</div>
-      <a href="/admin/settings">Configure →</a>
+  <div class="card stat-tile">
+    <span class="stat-value">{{ stats.processing }}</span>
+    <span class="stat-label">Processing</span>
+    <span class="meta" style="font-size:0.8rem;">{{ stats.queued_jobs }} job{{ 's' if stats.queued_jobs != 1 }} queued</span>
+  </div>
+  <div class="card stat-tile">
+    <span class="stat-value" {% if stats.failed %}style="color: var(--danger);"{% endif %}>{{ stats.failed }}</span>
+    <span class="stat-label">Failed</span>
+    {% if stats.failed %}<a href="/admin/videos?status=failed">Review →</a>{% endif %}
+  </div>
+</div>
+
+{% if mail_status.site_url_missing %}
+  <div class="alert alert-error">
+    <strong>SITE_URL is not set.</strong>
+    SMTP is configured, but every link that goes into an email is built from
+    <code>SITE_URL</code> — the only other source of a hostname is the request&#39;s
+    <code>Host</code> header, which the client controls. Until it is set in the
+    environment file, password recovery is refused, invites cannot be emailed, and
+    no new-video notifications are sent.
+  </div>
+{% endif %}
+
+{% if mail_status.enabled %}
+  <div class="stat-grid">
+    <div class="card stat-tile">
+      <span class="stat-value">{{ stats.email_subscribers }}</span>
+      <span class="stat-label">Subscribed</span>
+      <span class="meta" style="font-size:0.8rem;">
+        {% if mail_status.notifications_on %}New-video emails on{% else %}Notifications disabled{% endif %}
+      </span>
     </div>
-  {% endif %}
+    <div class="card stat-tile">
+      <span class="stat-value">{{ stats.email_pending }}</span>
+      <span class="stat-label">Email queued</span>
+    </div>
+    <div class="card stat-tile">
+      <span class="stat-value">{{ stats.email_sent }}</span>
+      <span class="stat-label">Email sent</span>
+    </div>
+    <div class="card stat-tile">
+      <span class="stat-value" {% if stats.email_failed %}style="color: var(--danger);"{% endif %}>{{ stats.email_failed }}</span>
+      <span class="stat-label">Email failed</span>
+    </div>
+  </div>
+{% endif %}
+
+{% if failed_emails %}
+  <h2>Undeliverable email</h2>
+  <div class="table-wrap">
+    <table class="table-compact">
+      <thead>
+        <tr>
+          <th>To</th>
+          <th>Subject</th>
+          <th>Attempts</th>
+          <th>Last error</th>
+          <th>Queued</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for message in failed_emails %}
+          <tr>
+            <td>{{ message.to_address }}</td>
+            <td>{{ message.subject }}</td>
+            <td>{{ message.attempts }}</td>
+            <td style="max-width:340px; word-break:break-word;">
+              <span class="meta">{{ (message.last_error or '—')[:200] }}</span>
+            </td>
+            <td title="{{ message.created_at }}">{{ message.created_at|timeago }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
+{% if failed_jobs %}
+  <h2>Failed transcodes</h2>
+  <div class="table-wrap">
+    <table class="table-compact">
+      <thead>
+        <tr>
+          <th>Video</th>
+          <th>Attempts</th>
+          <th>Last error</th>
+          <th>Failed</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in failed_jobs %}
+          <tr>
+            <td><a href="/videos/{{ job.uuid }}">{{ job.title }}</a></td>
+            <td>{{ job.attempts }}</td>
+            <td style="max-width:380px; word-break:break-word;">
+              <span class="meta">{{ (job.last_error or '—')[:200] }}</span>
+            </td>
+            <td>{{ job.finished_at|timeago }}</td>
+            <td>
+              <form method="POST" action="/admin/videos/{{ job.uuid }}/retry" style="display:inline;">
+                <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+                <button type="submit" class="btn btn-secondary btn-small">Retry</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
+<div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); margin-top:1.75rem;">
+  <div>
+    <h2>Storage by user</h2>
+    {% if storage_by_user %}
+      <div class="table-wrap">
+        <table class="table-compact">
+          <thead>
+            <tr><th>User</th><th>Videos</th><th>Storage</th></tr>
+          </thead>
+          <tbody>
+            {% for row in storage_by_user %}
+              <tr>
+                <td><a href="/u/{{ row.id }}">{{ row.display_name or row.email }}</a></td>
+                <td>{{ row.video_count }}</td>
+                <td>{{ row.total_bytes|filesizeformat(true) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="meta">No users yet.</p>
+    {% endif %}
+  </div>
+
+  <div>
+    <h2>Recent registrations</h2>
+    {% if recent_users %}
+      <div class="table-wrap">
+        <table class="table-compact">
+          <thead>
+            <tr><th>User</th><th>Role</th><th>Joined</th></tr>
+          </thead>
+          <tbody>
+            {% for row in recent_users %}
+              <tr>
+                <td>
+                  <a href="/u/{{ row.id }}">{{ row.display_name or row.email }}</a>
+                  <div class="meta" style="font-size:0.78rem;">{{ row.email }}</div>
+                </td>
+                <td>{{ row.role }}</td>
+                <td>{{ row.created_at|timeago }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="meta">No users yet.</p>
+    {% endif %}
+  </div>
 </div>
 {% endblock %}

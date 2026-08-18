@@ -17,6 +17,24 @@
         <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
         <label for="display_name">Display name</label>
         <input type="text" id="display_name" name="display_name" value="{{ profile_user.display_name or '' }}" required maxlength="80">
+
+        {% if mail_enabled %}
+          <label style="margin-top:1.25rem;">Email notifications</label>
+          <label class="checkbox-row" for="notify_new_videos">
+            <input type="checkbox" id="notify_new_videos" name="notify_new_videos" value="1"
+                   {% if notify_new_videos %}checked{% endif %}>
+            <span>Email me when someone posts a new video</span>
+          </label>
+          <p class="field-hint">
+            Every notification also carries an unsubscribe link, so you can turn these off
+            straight from your inbox.
+          </p>
+        {% else %}
+          <p class="field-hint" style="margin-top:1.25rem;">
+            This site is not configured to send email, so there are no notification settings.
+          </p>
+        {% endif %}
+
         <div style="margin-top:1rem;">
           <button type="submit" class="btn">Save</button>
         </div>
@@ -45,6 +63,49 @@
         </div>
       </form>
     </details>
+
+    {% if sessions %}
+      <details style="margin-top:1.25rem;" {% if request.query_params.get('sessions_revoked') %}open{% endif %}>
+        <summary class="btn btn-secondary btn-small" style="cursor:pointer; display:inline-flex; width:auto;">
+          Active sessions ({{ sessions|length }})
+        </summary>
+        <div class="edit-form" style="max-width:640px;">
+          {% if request.query_params.get('sessions_revoked') %}
+            <div class="alert alert-success">Signed out {{ request.query_params.get('sessions_revoked') }} other session(s).</div>
+          {% endif %}
+          <p class="meta">Every device currently signed in to your account. Revoke anything you do not recognise.</p>
+
+          {% for s in sessions %}
+            <div class="session-row">
+              <div class="session-detail">
+                <strong>{{ s.user_agent|device }}</strong>
+                {% if s.id == current_session_id %}<span class="badge badge-success">this device</span>{% endif %}
+                <div class="meta">
+                  {{ s.ip or 'unknown IP' }} ·
+                  {% if s.last_used_at %}last used {{ s.last_used_at|timeago }}{% else %}signed in {{ s.created_at|timeago }}{% endif %} ·
+                  expires {{ s.expires_at|timeago }}
+                </div>
+              </div>
+              <form method="POST" action="/profile/sessions/{{ s.id }}/revoke"
+                    data-confirm="{% if s.id == current_session_id %}Sign out of this device now?{% else %}Sign out this session?{% endif %}">
+                <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+                <button type="submit" class="btn btn-danger btn-small">
+                  {% if s.id == current_session_id %}Sign out{% else %}Revoke{% endif %}
+                </button>
+              </form>
+            </div>
+          {% endfor %}
+
+          {% if sessions|length > 1 %}
+            <form method="POST" action="/profile/sessions/revoke-others" style="margin-top:1rem;"
+                  data-confirm="Sign out every other device?">
+              <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+              <button type="submit" class="btn btn-secondary btn-small">Sign out all other devices</button>
+            </form>
+          {% endif %}
+        </div>
+      </details>
+    {% endif %}
 
     <p class="meta" style="margin-top:1.25rem;">
       <a href="/auth/totp/setup">Set up two-factor authentication</a> · <a href="/auth/passkeys">Manage passkeys</a>
@@ -77,6 +138,13 @@
             {% if video.visibility == 'private' %} · <span class="chip" style="padding:0.1rem 0.5rem;">Private</span>{% endif %}
             {% if video.status != 'ready' %} · {{ video.status }}{% endif %}
           </div>
+          {% if user and user.id == profile_user.id %}
+            <form method="POST" action="/videos/{{ video.uuid }}/delete" style="margin-top:0.6rem;"
+                  data-confirm="Delete this video permanently? The original, every quality version and the thumbnail will be removed.">
+              <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+              <button type="submit" class="btn btn-danger btn-small">Delete</button>
+            </form>
+          {% endif %}
         </div>
       </article>
     {% endfor %}

@@ -385,3 +385,281 @@ async def test_chunked_upload_oversize_rejected(client, logged_in_member, csrf):
         files={"chunk": ("clip.mp4", io.BytesIO(b"abcd"), "video/mp4")},
     )
     assert resp.status_code == 413
+
+
+# ---------------------------------------------------------------------------
+# Owner video management
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_owner_can_delete_own_video(client, logged_in_member, db):
+    csrf = client.cookies.get("csrf")
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id)
+
+    resp = await client.post(
+        f"/videos/{video_uuid}/delete", data={"csrf": csrf}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/profile"
+
+    page = await client.get(f"/videos/{video_uuid}", follow_redirects=False)
+    assert page.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_non_owner_cannot_delete_video(client, logged_in_member, admin_user, db):
+    csrf = client.cookies.get("csrf")
+    owner_id = await _user_id_by_email(db, admin_user["email"])
+    video_uuid = await _create_video(db, owner_id)
+
+    resp = await client.post(
+        f"/videos/{video_uuid}/delete", data={"csrf": csrf}, follow_redirects=False
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_delete_video_requires_csrf(client, logged_in_member, db):
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id)
+
+    resp = await client.post(f"/videos/{video_uuid}/delete", follow_redirects=False)
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_can_delete_members_video(client, logged_in_admin, member_user, db):
+    csrf = client.cookies.get("csrf")
+    owner_id = await _user_id_by_email(db, member_user["email"])
+    video_uuid = await _create_video(db, owner_id)
+
+    resp = await client.post(
+        f"/videos/{video_uuid}/delete", data={"csrf": csrf}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/admin/videos"
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_files_from_disk(client, logged_in_member, db):
+    """Deleting a video must take its files with it, not just the DB row."""
+    from app.config import Config
+
+    csrf = client.cookies.get("csrf")
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id)
+
+    out_dir = Config.UPLOAD_DIR / "videos" / video_uuid
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rendition = out_dir / "720p.mp4"
+    rendition.write_bytes(b"rendition bytes")
+    thumb = out_dir / "poster.jpg"
+    thumb.write_bytes(b"thumb bytes")
+    raw = Config.UPLOAD_DIR / "raw" / f"{video_uuid}.mp4"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_bytes(b"raw bytes")
+
+    cursor = await db.execute("SELECT id FROM videos WHERE uuid = ?", (video_uuid,))
+    video_id = (await cursor.fetchone())["id"]
+    await db.execute(
+        "UPDATE videos SET raw_path = ?, thumbnail_path = ? WHERE id = ?",
+        (str(raw), str(thumb), video_id),
+    )
+    await db.execute(
+        "INSERT INTO video_renditions (video_id, label, file_path, status) VALUES (?, '720p', ?, 'ready')",
+        (video_id, str(rendition)),
+    )
+    await db.commit()
+
+    resp = await client.post(
+        f"/videos/{video_uuid}/delete", data={"csrf": csrf}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+
+    assert not raw.exists()
+    assert not rendition.exists()
+    assert not thumb.exists()
+    assert not out_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Visibility editing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_owner_can_change_visibility(client, logged_in_member, db):
+    csrf = client.cookies.get("csrf")
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id, visibility="site")
+
+    resp = await client.post(
+        f"/videos/{video_uuid}/edit",
+        data={"title": "Now private", "description": "", "visibility": "private", "csrf": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    cursor = await db.execute("SELECT visibility FROM videos WHERE uuid = ?", (video_uuid,))
+    assert (await cursor.fetchone())["visibility"] == "private"
+
+
+@pytest.mark.asyncio
+async def test_edit_without_visibility_field_preserves_it(client, logged_in_member, db):
+    """Omitting the field must not silently flip a private video public."""
+    csrf = client.cookies.get("csrf")
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id, visibility="private")
+
+    resp = await client.post(
+        f"/videos/{video_uuid}/edit",
+        data={"title": "Still private", "description": "", "csrf": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    cursor = await db.execute("SELECT visibility FROM videos WHERE uuid = ?", (video_uuid,))
+    assert (await cursor.fetchone())["visibility"] == "private"
+
+
+@pytest.mark.asyncio
+async def test_edit_rejects_bad_visibility(client, logged_in_member, db):
+    csrf = client.cookies.get("csrf")
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id)
+
+    resp = await client.post(
+        f"/videos/{video_uuid}/edit",
+        data={"title": "Bad", "description": "", "visibility": "everyone", "csrf": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Processing state and status polling
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_processing_video_shows_panel_not_empty_player(client, logged_in_member, db):
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id, status="processing")
+
+    page = await client.get(f"/videos/{video_uuid}", follow_redirects=False)
+    assert page.status_code == 200
+    assert "Processing your video" in page.text
+    assert "processing-panel" in page.text
+    # No player element at all while there is nothing to play.
+    assert 'id="video-player"' not in page.text
+
+
+@pytest.mark.asyncio
+async def test_status_endpoint_reports_progress(client, logged_in_member, db):
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id, status="processing")
+
+    cursor = await db.execute("SELECT id FROM videos WHERE uuid = ?", (video_uuid,))
+    video_id = (await cursor.fetchone())["id"]
+    await db.execute(
+        "INSERT INTO video_renditions (video_id, label, file_path, status) VALUES (?, '720p', 'a.mp4', 'ready')",
+        (video_id,),
+    )
+    await db.execute(
+        "INSERT INTO video_renditions (video_id, label, file_path, status) VALUES (?, '480p', 'b.mp4', 'pending')",
+        (video_id,),
+    )
+    await db.commit()
+
+    resp = await client.get(f"/videos/{video_uuid}/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ready"] is False
+    assert body["status"] == "processing"
+    assert body["renditions_ready"] == 1
+    assert body["renditions_total"] == 2
+    assert body["percent"] == 50
+
+
+@pytest.mark.asyncio
+async def test_status_endpoint_reports_ready(client, logged_in_member, db):
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id, status="ready")
+
+    resp = await client.get(f"/videos/{video_uuid}/status")
+    assert resp.status_code == 200
+    assert resp.json()["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_status_endpoint_respects_privacy(client, logged_in_member, admin_user, db):
+    owner_id = await _user_id_by_email(db, admin_user["email"])
+    video_uuid = await _create_video(db, owner_id, visibility="private")
+
+    resp = await client.get(f"/videos/{video_uuid}/status")
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_status_endpoint_requires_login(client, db, member_user):
+    owner_id = await _user_id_by_email(db, member_user["email"])
+    video_uuid = await _create_video(db, owner_id)
+
+    resp = await client.get(f"/videos/{video_uuid}/status", follow_redirects=False)
+    assert resp.status_code in (302, 303)
+
+
+@pytest.mark.asyncio
+async def test_failed_video_shows_failure_panel(client, logged_in_member, db):
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id, status="failed")
+
+    page = await client.get(f"/videos/{video_uuid}", follow_redirects=False)
+    assert page.status_code == 200
+    assert "could not be processed" in page.text
+
+
+# ---------------------------------------------------------------------------
+# Quality selector
+# ---------------------------------------------------------------------------
+
+async def _add_renditions(db, video_uuid, labels):
+    cursor = await db.execute("SELECT id FROM videos WHERE uuid = ?", (video_uuid,))
+    video_id = (await cursor.fetchone())["id"]
+    for label, height in labels:
+        await db.execute(
+            """
+            INSERT INTO video_renditions (video_id, label, height, file_path, status)
+            VALUES (?, ?, ?, ?, 'ready')
+            """,
+            (video_id, label, height, f"/srv/uploads/videos/{video_uuid}/{label}.mp4"),
+        )
+    await db.commit()
+    return video_id
+
+
+@pytest.mark.asyncio
+async def test_player_offers_every_ready_rendition(client, logged_in_member, db):
+    """All three renditions must be reachable, not just the first <source>."""
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id, status="ready")
+    await _add_renditions(db, video_uuid, [("720p", 720), ("480p", 480), ("360p", 360)])
+
+    page = await client.get(f"/videos/{video_uuid}", follow_redirects=False)
+    assert page.status_code == 200
+    assert 'id="quality-select"' in page.text
+    for label in ("720p", "480p", "360p"):
+        assert f"/stream/{video_uuid}/{label}.mp4" in page.text
+    # Highest quality is the default source.
+    assert f'src="/stream/{video_uuid}/720p.mp4"' in page.text
+
+
+@pytest.mark.asyncio
+async def test_single_rendition_has_no_quality_selector(client, logged_in_member, db):
+    owner_id = await _user_id_by_email(db, logged_in_member["email"])
+    video_uuid = await _create_video(db, owner_id, status="ready")
+    await _add_renditions(db, video_uuid, [("720p", 720)])
+
+    page = await client.get(f"/videos/{video_uuid}", follow_redirects=False)
+    assert page.status_code == 200
+    assert 'id="video-player"' in page.text
+    assert 'id="quality-select"' not in page.text

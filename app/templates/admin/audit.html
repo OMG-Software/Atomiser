@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Audit log — {{ site_title|default('Atomiser Site') }}{% endblock %}
+{% block content %}
+<div class="section-head">
+  <h1>Audit log</h1>
+  <div class="meta">{{ total }} entr{{ 'y' if total == 1 else 'ies' }}{% if filters.action or filters.user_id or filters.since or filters.until %} matching{% endif %}</div>
+</div>
+
+<form method="GET" action="/admin/audit" class="filter-bar">
+  <div class="field">
+    <label for="action">Action</label>
+    <select id="action" name="action">
+      <option value="">All actions</option>
+      {% for a in actions %}
+        <option value="{{ a }}" {% if filters.action == a %}selected{% endif %}>{{ a }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="user_id">User ID</label>
+    <input type="number" id="user_id" name="user_id" min="1" value="{{ filters.user_id or '' }}" placeholder="Any">
+  </div>
+  <div class="field">
+    <label for="since">From</label>
+    <input type="date" id="since" name="since" value="{{ filters.since }}">
+  </div>
+  <div class="field">
+    <label for="until">To</label>
+    <input type="date" id="until" name="until" value="{{ filters.until }}">
+  </div>
+  <button type="submit" class="btn btn-small">Filter</button>
+  <a class="btn btn-secondary btn-small" href="/admin/audit">Reset</a>
+</form>
+
+{% if entries %}
+  <div class="table-wrap">
+    <table class="table-compact">
+      <thead>
+        <tr>
+          <th>When</th>
+          <th>Action</th>
+          <th>User</th>
+          <th>Target</th>
+          <th>IP</th>
+          <th>User agent</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in entries %}
+          <tr>
+            <td title="{{ e.created_at }}">{{ e.created_at|timeago }}</td>
+            <td>
+              {% if e.action in ('login_failed', 'user_deleted', 'video_deleted', 'sessions_revoked') %}
+                <span class="badge badge-danger">{{ e.action }}</span>
+              {% elif e.action in ('login', 'login_passkey', 'registered') %}
+                <span class="badge badge-success">{{ e.action }}</span>
+              {% else %}
+                <span class="badge badge-info">{{ e.action }}</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if e.user_id %}
+                <a href="/u/{{ e.user_id }}">{{ e.user_email or e.user_id }}</a>
+              {% else %}
+                <span class="meta">—</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if e.target_type %}
+                <span class="meta">{{ e.target_type }}</span>
+                {% if e.target_type == 'video' %}
+                  <a href="/videos/{{ e.target_id }}"><code>{{ e.target_id[:8] }}</code></a>
+                {% else %}
+                  <code>{{ e.target_id }}</code>
+                {% endif %}
+              {% else %}
+                <span class="meta">—</span>
+              {% endif %}
+            </td>
+            <td><code>{{ e.ip or '—' }}</code></td>
+            <td style="max-width:260px;">
+              <span class="meta" title="{{ e.user_agent }}">{{ (e.user_agent or '—')[:60] }}{% if e.user_agent and e.user_agent|length > 60 %}…{% endif %}</span>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="pager">
+    {% set qs %}action={{ filters.action }}&user_id={{ filters.user_id or '' }}&since={{ filters.since }}&until={{ filters.until }}{% endset %}
+    {% if page > 1 %}<a href="/admin/audit?{{ qs }}&page={{ page - 1 }}">← Newer</a>{% endif %}
+    <span>Page {{ page }} of {{ ((total - 1) // page_size) + 1 if total else 1 }}</span>
+    {% if has_next %}<a href="/admin/audit?{{ qs }}&page={{ page + 1 }}">Older →</a>{% endif %}
+  </div>
+{% else %}
+  <div class="empty-state">
+    <h2>Nothing to show</h2>
+    <p>No audit entries match these filters.</p>
+  </div>
+{% endif %}
+{% endblock %}

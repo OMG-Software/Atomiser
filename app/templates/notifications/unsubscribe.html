@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Email notifications — {{ site_title|default('Atomiser Site') }}{% endblock %}
+{% block content %}
+<div class="card auth-card">
+  {% if not target %}
+    <h1>Link not recognised</h1>
+    <div class="alert alert-error" style="margin-top:1rem;">
+      This unsubscribe link is not valid. It may have been altered in transit, or the
+      account may no longer exist.
+    </div>
+    <p class="meta">
+      You can always change this from your profile:
+      <a href="/profile">notification settings</a>.
+    </p>
+
+  {% elif done %}
+    <h1>{% if subscribed %}You're subscribed again{% else %}Unsubscribed{% endif %}</h1>
+    <div class="alert alert-success" style="margin-top:1rem;">
+      {% if subscribed %}
+        {{ target.email }} will receive an email when someone posts a new video.
+      {% else %}
+        {{ target.email }} will no longer receive new-video emails from {{ site_title }}.
+      {% endif %}
+    </div>
+
+    {% if not subscribed %}
+      <p class="meta">Changed your mind?</p>
+      <form method="POST" action="/notifications/unsubscribe">
+        <input type="hidden" name="token" value="{{ token }}">
+        <input type="hidden" name="resubscribe" value="1">
+        <button type="submit" class="btn btn-secondary btn-block">Turn notifications back on</button>
+      </form>
+    {% endif %}
+
+    <p class="meta" style="margin-top:1.25rem;">
+      <a href="/">Go to {{ site_title }}</a>
+    </p>
+
+  {% elif not subscribed %}
+    <h1>Already unsubscribed</h1>
+    <p class="meta" style="margin-top:0.5rem;">
+      {{ target.email }} is not receiving new-video emails from {{ site_title }}.
+    </p>
+    <form method="POST" action="/notifications/unsubscribe" style="margin-top:1rem;">
+      <input type="hidden" name="token" value="{{ token }}">
+      <input type="hidden" name="resubscribe" value="1">
+      <button type="submit" class="btn btn-block">Turn notifications back on</button>
+    </form>
+
+  {% else %}
+    <h1>Unsubscribe</h1>
+    <p class="meta" style="margin-top:0.5rem;">
+      Stop sending new-video emails to <strong>{{ target.email }}</strong>?
+    </p>
+    <p class="field-hint">
+      You will still be able to see everything on the site — this only turns off the emails.
+      You can turn them back on any time from your profile.
+    </p>
+
+    {# The confirmation is deliberate: mail scanners and link prefetchers follow
+       URLs in email, so a GET must never be what actually unsubscribes someone. #}
+    <form method="POST" action="/notifications/unsubscribe" style="margin-top:1.25rem;">
+      <input type="hidden" name="token" value="{{ token }}">
+      <button type="submit" class="btn btn-block">Yes, unsubscribe me</button>
+    </form>
+
+    <p class="meta" style="margin-top:1rem; text-align:center;">
+      <a href="/">No, keep them coming</a>
+    </p>
+  {% endif %}
+</div>
+{% endblock %}

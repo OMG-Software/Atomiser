@@ -201,3 +201,135 @@ async def test_change_password_requires_csrf(client, logged_in_member):
         follow_redirects=False,
     )
     assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+
+async def _user_id(db, email):
+    cursor = await db.execute("SELECT id FROM users WHERE email = ?", (email,))
+    row = await cursor.fetchone()
+    return row["id"]
+
+
+@pytest.mark.asyncio
+async def test_profile_lists_active_sessions(client, logged_in_member):
+    resp = await client.get("/profile")
+    assert resp.status_code == 200
+    assert "Active sessions" in resp.text
+    assert "this device" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_webauthn_challenge_rows_are_not_listed_as_sessions(client, logged_in_member, db):
+    """Passkey challenge rows share the sessions table but are not logins."""
+    from app.utils import generate_token, hash_token, now_utc
+    from datetime import timedelta
+
+    user_id = await _user_id(db, logged_in_member["email"])
+    await db.execute(
+        "INSERT INTO sessions (token_hash, user_id, expires_at, purpose) VALUES (?, ?, ?, 'webauthn')",
+        (hash_token(generate_token()), user_id, (now_utc() + timedelta(minutes=5)).isoformat()),
+    )
+    await db.commit()
+
+    resp = await client.get("/profile")
+    assert resp.status_code == 200
+    # Only the real login session is offered for revocation.
+    assert resp.text.count("/profile/sessions/") == 1
+
+
+@pytest.mark.asyncio
+async def test_revoke_other_session(client, logged_in_member, db):
+    from app.auth import create_session
+
+    user_id = await _user_id(db, logged_in_member["email"])
+    await create_session(db, user_id, "10.0.0.2", "other device")
+
+    cursor = await db.execute(
+        "SELECT id FROM sessions WHERE user_id = ? AND ip = '10.0.0.2'", (user_id,)
+    )
+    other_id = (await cursor.fetchone())["id"]
+
+    csrf = client.cookies.get("csrf")
+    resp = await client.post(
+        f"/profile/sessions/{other_id}/revoke", data={"csrf": csrf}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+
+    cursor = await db.execute("SELECT COUNT(*) AS c FROM sessions WHERE id = ?", (other_id,))
+    assert (await cursor.fetchone())["c"] == 0
+
+    # The caller stays signed in.
+    assert (await client.get("/profile", follow_redirects=False)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_cannot_revoke_another_users_session(client, logged_in_member, admin_user, db):
+    """Scoping the delete by user id is what stops cross-account revocation."""
+    from app.auth import create_session
+
+    victim_id = await _user_id(db, admin_user["email"])
+    await create_session(db, victim_id, "10.0.0.3", "victim device")
+    cursor = await db.execute(
+        "SELECT id FROM sessions WHERE user_id = ? AND ip = '10.0.0.3'", (victim_id,)
+    )
+    victim_session = (await cursor.fetchone())["id"]
+
+    csrf = client.cookies.get("csrf")
+    resp = await client.post(
+        f"/profile/sessions/{victim_session}/revoke", data={"csrf": csrf}, follow_redirects=False
+    )
+    assert resp.status_code == 404
+
+    cursor = await db.execute("SELECT COUNT(*) AS c FROM sessions WHERE id = ?", (victim_session,))
+    assert (await cursor.fetchone())["c"] == 1
+
+
+@pytest.mark.asyncio
+async def test_revoking_current_session_signs_you_out(client, logged_in_member, db):
+    user_id = await _user_id(db, logged_in_member["email"])
+    cursor = await db.execute(
+        "SELECT id FROM sessions WHERE user_id = ? AND purpose = 'session'", (user_id,)
+    )
+    current = (await cursor.fetchone())["id"]
+
+    csrf = client.cookies.get("csrf")
+    resp = await client.post(
+        f"/profile/sessions/{current}/revoke", data={"csrf": csrf}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/auth/login"
+
+    follow = await client.get("/profile", follow_redirects=False)
+    assert follow.status_code in (302, 303)
+
+
+@pytest.mark.asyncio
+async def test_revoke_others_keeps_current_session(client, logged_in_member, db):
+    from app.auth import create_session
+
+    user_id = await _user_id(db, logged_in_member["email"])
+    await create_session(db, user_id, "10.0.0.4", "device a")
+    await create_session(db, user_id, "10.0.0.5", "device b")
+
+    csrf = client.cookies.get("csrf")
+    resp = await client.post(
+        "/profile/sessions/revoke-others", data={"csrf": csrf}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+
+    cursor = await db.execute("SELECT COUNT(*) AS c FROM sessions WHERE user_id = ?", (user_id,))
+    assert (await cursor.fetchone())["c"] == 1
+    assert (await client.get("/profile", follow_redirects=False)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_revoke_session_requires_csrf(client, logged_in_member, db):
+    user_id = await _user_id(db, logged_in_member["email"])
+    cursor = await db.execute("SELECT id FROM sessions WHERE user_id = ?", (user_id,))
+    session_id = (await cursor.fetchone())["id"]
+
+    resp = await client.post(f"/profile/sessions/{session_id}/revoke", follow_redirects=False)
+    assert resp.status_code == 403

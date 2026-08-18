@@ -7,7 +7,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app import auth, invites, users, admin, videos
+from app import auth, invites, jobs, notifications, users, admin, videos
 from app.config import Config, BASE_DIR
 from app.db import init_db
 from app.utils import generate_csrf
@@ -17,7 +17,20 @@ from app.utils import generate_csrf
 async def lifespan(app: FastAPI):
     # Apply database migrations on startup.
     await init_db()
-    yield
+    # Start the transcode workers, which also requeue anything a previous
+    # process left half-finished.
+    if Config.RUN_TRANSCODE_WORKER:
+        await jobs.start_workers()
+    # Drains the outbound email queue (new-video notifications).
+    if Config.RUN_EMAIL_WORKER:
+        await notifications.start_workers()
+    try:
+        yield
+    finally:
+        if Config.RUN_EMAIL_WORKER:
+            await notifications.stop_workers()
+        if Config.RUN_TRANSCODE_WORKER:
+            await jobs.stop_workers()
 
 
 app = FastAPI(title="Atomiser", lifespan=lifespan)
@@ -115,7 +128,42 @@ def _avatar_color(value) -> str:
     return f"hsl({h}, 62%, 52%)"
 
 
+def _device(user_agent) -> str:
+    """Turn a User-Agent string into a short 'Browser on OS' label.
+
+    Deliberately crude: this only has to help someone recognise their own
+    devices in the session list, not identify a browser precisely.
+    """
+    ua = str(user_agent or "").strip()
+    if not ua:
+        return "Unknown device"
+
+    browsers = [
+        ("Edg/", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"),
+        ("Chrome/", "Chrome"), ("Safari/", "Safari"),
+    ]
+    systems = [
+        ("Windows NT 10", "Windows"), ("Windows", "Windows"), ("iPhone", "iPhone"),
+        ("iPad", "iPad"), ("Android", "Android"), ("Mac OS X", "macOS"),
+        ("Macintosh", "macOS"), ("CrOS", "ChromeOS"), ("Linux", "Linux"),
+    ]
+
+    # Order matters: Edge and Opera both also claim "Chrome", and everything
+    # Chromium-based also claims "Safari".
+    browser = next((name for token, name in browsers if token in ua), None)
+    system = next((name for token, name in systems if token in ua), None)
+
+    if browser and system:
+        return f"{browser} on {system}"
+    if browser:
+        return browser
+    if system:
+        return system
+    return ua[:40]
+
+
 app_templates.env.filters["timeago"] = _timeago
+app_templates.env.filters["device"] = _device
 app_templates.env.filters["initials"] = _initials
 app_templates.env.filters["duration"] = _duration
 app_templates.env.filters["avatar_color"] = _avatar_color
@@ -149,6 +197,7 @@ invites.templates = app_templates
 users.templates = app_templates
 admin.templates = app_templates
 videos.templates = app_templates
+notifications.templates = app_templates
 
 # Static files (development convenience; nginx serves these in production).
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "app" / "static")), name="static")
@@ -158,6 +207,7 @@ app.include_router(auth.router)
 app.include_router(invites.router)
 app.include_router(users.router)
 app.include_router(admin.router)
+app.include_router(notifications.router)
 app.include_router(videos.router)
 
 

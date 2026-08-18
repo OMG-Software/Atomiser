@@ -1,56 +1,84 @@
 {% extends "base.html" %}
 {% block title %}Users — {{ site_title|default('Atomiser Site') }}{% endblock %}
 {% block content %}
-<h1>Users</h1>
+<div class="section-head">
+  <h1>Users</h1>
+  <div class="meta">{{ users|length }} account{{ 's' if users|length != 1 }}</div>
+</div>
 
-<table>
-  <thead>
-    <tr>
-      <th>ID</th>
-      <th>Email</th>
-      <th>Display name</th>
-      <th>Role</th>
-      <th>2FA</th>
-      <th>Joined</th>
-      <th>Actions</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for u in users %}
+{% if request.query_params.get('logged_out') %}
+  <div class="alert alert-success">
+    Revoked {{ request.query_params.get('logged_out') }} session(s). That user will have to sign in again.
+  </div>
+{% endif %}
+
+<div class="table-wrap">
+  <table class="table-compact">
+    <thead>
       <tr>
-        <td>{{ u.id }}</td>
-        <td>{{ u.email }}</td>
-        <td>{{ u.display_name or '—' }}</td>
-        <td>
-          {{ u.role }}
-          {% if u.is_bootstrap %}<span class="badge badge-info" title="Bootstrap account — role cannot be changed">bootstrap</span>{% endif %}
-        </td>
-        <td>{% if u.totp_enabled %}✓{% else %}—{% endif %}</td>
-        <td>{{ u.created_at }}</td>
-        <td>
-          {% if user.role == 'configurator' and u.id != user.id and u.role != 'configurator' and not u.is_bootstrap %}
-            <form method="POST" action="/admin/users/{{ u.id }}/role" class="inline-form">
-              <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
-              <select name="role">
-                <option value="member" {% if u.role == 'member' %}selected{% endif %}>Member</option>
-                <option value="admin" {% if u.role == 'admin' %}selected{% endif %}>Admin</option>
-              </select>
-              <button type="submit" class="btn btn-small">Update</button>
-            </form>
-          {% endif %}
-          {% if u.id != user.id and not u.is_bootstrap %}
-            <form method="POST" action="/admin/users/{{ u.id }}/reset-password" style="display:inline;" onsubmit="return confirm('Reset this user\\'s password to a new random one? The new password will be shown once.')">
-              <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
-              <button type="submit" class="btn btn-secondary btn-small">Reset password</button>
-            </form>
-            <form method="POST" action="/admin/users/{{ u.id }}/delete" style="display:inline;" onsubmit="return confirm('Delete this user and all their videos?')">
-              <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
-              <button type="submit" class="btn btn-danger">Delete</button>
-            </form>
-          {% endif %}
-        </td>
+        <th>ID</th>
+        <th>Email</th>
+        <th>Display name</th>
+        <th>Role</th>
+        <th>2FA</th>
+        <th>Sessions</th>
+        <th>Joined</th>
+        <th>Actions</th>
       </tr>
-    {% endfor %}
-  </tbody>
-</table>
+    </thead>
+    <tbody>
+      {% for u in users %}
+        <tr>
+          <td>{{ u.id }}</td>
+          <td>{{ u.email }}</td>
+          <td>{{ u.display_name or '—' }}</td>
+          <td>
+            {{ u.role }}
+            {% if u.is_bootstrap %}<span class="badge badge-info" title="Bootstrap account — role cannot be changed">bootstrap</span>{% endif %}
+          </td>
+          <td>{% if u.totp_enabled %}✓{% else %}—{% endif %}</td>
+          <td>
+            {% if u.session_count %}
+              {{ u.session_count }}
+            {% else %}
+              <span class="meta">—</span>
+            {% endif %}
+          </td>
+          <td title="{{ u.created_at }}">{{ u.created_at|timeago }}</td>
+          <td>
+            {% if user.role == 'configurator' and u.id != user.id and u.role != 'configurator' and not u.is_bootstrap %}
+              <form method="POST" action="/admin/users/{{ u.id }}/role" class="inline-form">
+                <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+                <select name="role">
+                  <option value="member" {% if u.role == 'member' %}selected{% endif %}>Member</option>
+                  <option value="admin" {% if u.role == 'admin' %}selected{% endif %}>Admin</option>
+                </select>
+                <button type="submit" class="btn btn-small">Update</button>
+              </form>
+            {% endif %}
+            {% if u.session_count %}
+              <form method="POST" action="/admin/users/{{ u.id }}/logout" style="display:inline;"
+                    data-confirm="Sign this user out of every device? They will need to log in again.">
+                <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+                <button type="submit" class="btn btn-secondary btn-small">Sign out</button>
+              </form>
+            {% endif %}
+            {% if u.id != user.id and not u.is_bootstrap %}
+              <form method="POST" action="/admin/users/{{ u.id }}/reset-password" style="display:inline;"
+                    data-confirm="Reset this user's password to a new random one? The new password will be shown once.">
+                <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+                <button type="submit" class="btn btn-secondary btn-small">Reset password</button>
+              </form>
+              <form method="POST" action="/admin/users/{{ u.id }}/delete" style="display:inline;"
+                    data-confirm="Delete this user, all their videos and every file those videos own? This cannot be undone.">
+                <input type="hidden" name="csrf" value="{{ request.state.csrf_token }}">
+                <button type="submit" class="btn btn-danger btn-small">Delete</button>
+              </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
 {% endblock %}
