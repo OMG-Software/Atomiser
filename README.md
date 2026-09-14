@@ -54,10 +54,10 @@ The recommended stack is a Linux VPS/bare-metal server with nginx as a reverse p
 
 1. Create an unprivileged user and deploy the code to `/opt/atomiser`.
 2. Create `/etc/atomiser/atomiser.env` from `.env.example` and set `ENV=production`, `SECRET_KEY`, paths, etc.
-3. Create the runtime directory and set permissions:
+3. Create the data directories and set permissions (systemd creates the socket directory `/run/atomiser` itself on every start):
    ```bash
-   sudo mkdir -p /run/atomiser /opt/atomiser/data /opt/atomiser/uploads
-   sudo chown -R atomiser:atomiser /opt/atomiser /run/atomiser
+   sudo mkdir -p /opt/atomiser/data /opt/atomiser/uploads
+   sudo chown -R atomiser:atomiser /opt/atomiser
    ```
 4. Bootstrap the first Configurator:
    ```bash

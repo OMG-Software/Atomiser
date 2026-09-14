@@ -3,9 +3,16 @@ Description=Atomiser private video hosting app
 After=network.target
 
 [Service]
-Type=notify
+# uvicorn never sends sd_notify READY=1, so Type=notify would hang in
+# "activating" until TimeoutStartSec kills it. exec reports a failed spawn.
+Type=exec
 User=atomiser
 Group=atomiser
+# /run is a tmpfs wiped at boot; systemd creates /run/atomiser (owned by
+# User=) before every start. A mkdir'd directory vanishes on reboot, and a
+# missing ReadWritePaths entry fails the unit with 226/NAMESPACE.
+RuntimeDirectory=atomiser
+RuntimeDirectoryMode=0755
 WorkingDirectory=/opt/atomiser
 Environment="PATH=/opt/atomiser/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/etc/atomiser/atomiser.env
@@ -19,7 +26,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/atomiser/data /opt/atomiser/uploads /run/atomiser
+ReadWritePaths=/opt/atomiser/data /opt/atomiser/uploads
 
 [Install]
 WantedBy=multi-user.target

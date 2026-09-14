@@ -86,12 +86,14 @@ sudo -u atomiser /opt/atomiser/venv/bin/pip install -r /opt/atomiser/requirement
 
 > Unlike `rsync --delete`, `unzip -o` only overwrites the paths present in the archive. It will **not** delete `app/__init__.py`, and it will never touch `/opt/atomiser/data`, `/opt/atomiser/uploads`, or `/etc/atomiser/atomiser.env`.
 
-Create the runtime directories:
+Create the data directories:
 
 ```bash
-sudo mkdir -p /opt/atomiser/data /opt/atomiser/uploads/raw /opt/atomiser/uploads/videos /run/atomiser
-sudo chown -R atomiser:atomiser /opt/atomiser /run/atomiser
+sudo mkdir -p /opt/atomiser/data /opt/atomiser/uploads/raw /opt/atomiser/uploads/videos
+sudo chown -R atomiser:atomiser /opt/atomiser
 ```
+
+Do **not** create `/run/atomiser` by hand. `/run` is a tmpfs that is emptied on every boot, so a manually created directory disappears after the first reboot and the service then fails with `status=226/NAMESPACE`. The unit's `RuntimeDirectory=atomiser` has systemd create it, owned by the `atomiser` user, each time the service starts.
 
 ---
 
@@ -305,7 +307,7 @@ sudo systemctl status atomiser
 sudo journalctl -u atomiser -n 50 --no-pager
 ```
 
-The service uses `Type=notify`, so make sure the installed version of uvicorn supports systemd notification, or change `Type=notify` to `Type=simple` if you see start-timeout errors.
+The service uses `Type=exec`. Do not switch it to `Type=notify`: uvicorn never sends the systemd readiness notification, so the unit would sit in `activating` until the start timeout kills it.
 
 ---
 
@@ -384,7 +386,7 @@ Fedora 44 defaults to enforcing SELinux. nginx must be allowed to proxy to a loc
 
 ```bash
 # Restore default contexts on the app directories
-sudo restorecon -Rv /opt/atomiser /run/atomiser
+sudo restorecon -Rv /opt/atomiser
 
 # Allow nginx to connect to the local unix socket
 sudo setsebool -P httpd_can_network_connect 1
@@ -624,7 +626,7 @@ sudo journalctl -u atomiser -n 100 --no-pager
 Common causes:
 
 - Missing or unreadable `/etc/atomiser/atomiser.env`.
-- The `/run/atomiser` directory is missing or has wrong ownership.
+- `status=226/NAMESPACE` with `Failed to set up mount namespacing: /run/atomiser: No such file or directory`: the installed unit predates `RuntimeDirectory=atomiser` and relied on a hand-made directory that was wiped at reboot. Reinstall `nginx/atomiser.service` and run `sudo systemctl daemon-reload`. The same error for any other path means a `ReadWritePaths=` entry (such as `/opt/atomiser/uploads`) does not exist.
 - SQLite database directory does not exist.
 - SELinux is blocking access; check `/var/log/audit/audit.log`.
 
